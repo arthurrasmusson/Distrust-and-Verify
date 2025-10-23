@@ -49,6 +49,7 @@ MAX_FINDINGS=8           # first N non‑zero offsets to record during blankness
 LARGE_WARN_TB=2          # warn if device > 2 TB
 SAMPLE_WIN_DEFAULT="1M"  # sample window size for hashing
 UMOUNT_TIMEOUT=10
+POST_SANITIZE="auto"     # auto|never|force
 
 # Derived later
 OS=""
@@ -88,6 +89,12 @@ VERIFY_PASSED="unknown"
 UNCHANGED_RANGES="[]"
 ZERO_RANGES="[]"
 ERRORS="[]"
+
+# Post-sanitize reporting
+SAN_SUPPORTED="false"
+SAN_SELECTED_METHOD=""   # nvme_format_s1 | ata_sec_erase_enh | ata_sec_erase | scsi_sanitize_crypto
+SAN_RESULT="skipped"
+SAN_REASON=""
 
 #############################################################################
 # Minimal colors (safe fallback if tput/tty not present)
@@ -199,6 +206,7 @@ Usage:
                              [--openbsd-adapt] [--run-smart] [--probe-ro]
                              [--check-hidden] [--export-logs]
                              [--sign-logs[=GPG_ID]] [--firmware-scan] [--force]
+                             [--post-sanitize=auto|never|force]
 
 If --mode is omitted, an interactive menu is shown.
 SIZE accepts decimal or K/M/G suffixes (powers of 1024).
@@ -229,6 +237,7 @@ parse_args() {
       --sign-logs=*) SIGN_LOGS=1; SIGN_ID="${1#*=}";;
       --firmware-scan) FIRMWARE_SCAN=1;;
       --force) FORCE=1;;
+      --post-sanitize=*) POST_SANITIZE="$(to_lower "${1#*=}")";;
       --max-findings=*) MAX_FINDINGS="${1#*=}";;
       --help|-h) usage; exit 0;;
       *) err "Unknown argument: $1"; usage; exit 4;;
@@ -256,6 +265,11 @@ parse_args() {
   case "$HASH_VERIFY" in
     none|sample|full) : ;;
     *) die 4 "Invalid --hash-verify";;
+  esac
+
+  case "$POST_SANITIZE" in
+    auto|never|force) : ;;
+    *) die 4 "Invalid --post-sanitize (auto|never|force)";;
   esac
 
   # OpenBSD fallback switch
@@ -546,15 +560,21 @@ collect_linux_attrs() {
         case "$cls" in
           08) name="Mass Storage" ;;
           03) name="HID" ;;
-          02) name="CDC (Communications)" ;;
+          02) name="CDC \(Communications\)" ;;
           0a) name="CDC Data" ;;
           0e) name="Video" ;;
           e0) name="Wireless Controller" ;;
-          fe) name="Application (e.g., DFU)" ;;
+          fe) name="Application \(e.g., DFU\)" ;;
           ff) name="Vendor Specific" ;;
         esac
         item='{"class":"'"$cls"'","name":"'"$name"'"}'
-        if [ "$COMPOSITE_LIST" = "[]" ]; then COMPOSITE_LIST="[$item]"; else COMPOSITE_LIST="$(printf '%s' "$COMPOSITE_LIST" | sed 's/]$//'),$item]"; fi
+        # Append to COMPOSITE_LIST safely using a temporary variable
+        if [ "$COMPOSITE_LIST" = "[]" ]; then
+          COMPOSITE_LIST="[$item]"
+        else
+          tmp_comp="$(printf '%s' "$COMPOSITE_LIST" | sed 's/]$//')"
+          COMPOSITE_LIST="${tmp_comp},$item]"
+        fi
       done
       # bus:dev (best effort from lsusb -t or lsusb plain)
       BUS_DEV="$(lsusb 2>/dev/null | awk -v vp="$vp" '$0 ~ vp {print $2 ":" $4}' | sed 's/.$//' | head -n1)"
@@ -591,9 +611,19 @@ collect_openbsd_attrs() {
           [ -z "$off" ] && off=0
           [ -z "$sz" ] && sz=0
           item='{"name":"'"$pname"'","start":'"$off"',"end":'"$sz"',"fstype":"'"${fst:-unknown}"'"}'
-          if [ "$PART_JSON" = "[]" ]; then PART_JSON="[$item]"; else PART_JSON="$(printf '%s' "$PART_JSON" | sed 's/]$//'),$item]"; fi
+          # Append to PART_JSON safely using multi-line if to avoid quoting issues
+          if [ "$PART_JSON" = "[]" ]; then
+            PART_JSON="[$item]"
+          else
+            PART_JSON="$(printf '%s' "$PART_JSON" | sed 's/]$//'),$item]"
+          fi
+          # Append filesystem type to FS_LIST if non-empty
           if [ -n "$fst" ]; then
-            if [ "$FS_LIST" = "[]" ]; then FS_LIST='["'"$fst"'"]'; else FS_LIST="$(printf '%s' "$FS_LIST" | sed 's/]$//'),\"'"$fst"'"]"; fi
+            if [ "$FS_LIST" = "[]" ]; then
+              FS_LIST="[\"$fst\"]"
+            else
+              FS_LIST="$(printf '%s' "$FS_LIST" | sed 's/]$//'),\"$fst\"]"
+            fi
           fi
           ;;
       esac
@@ -1110,6 +1140,197 @@ verify_after_wipe() {
 }
 
 #############################################################################
+# Sanitize / Secure Erase capability discovery & execution (best-effort)
+#############################################################################
+
+_nvme_ctrl_from_ns() {
+  # /dev/nvme0n1 -> /dev/nvme0 ; else return empty
+  bn="$(basename "$DEVICE" 2>/dev/null)"
+  case "$bn" in
+    nvme*n*) printf '/dev/%s\n' "$(printf '%s' "$bn" | sed 's/n[0-9]\+$//')" ;;
+    *) printf '\n' ;;
+  esac
+}
+
+detect_sanitize_support() {
+  # Determine if any sanitize/secure-erase method is feasible. Sets:
+  #   SAN_SUPPORTED=true|false
+  #   SAN_SELECTED_METHOD=nvme_format_s1|ata_sec_erase_enh|ata_sec_erase|scsi_sanitize_crypto
+  SAN_SUPPORTED="false"
+  SAN_SELECTED_METHOD=""
+
+  # NVMe namespace: prefer 'nvme format -s1' on the namespace node
+  if have_cmd nvme; then
+    case "$(basename "$DEVICE" 2>/dev/null)" in
+      nvme*n*)
+        if nvme id-ctrl "$(_nvme_ctrl_from_ns)" >/dev/null 2>&1; then
+          SAN_SUPPORTED="true"
+          SAN_SELECTED_METHOD="nvme_format_s1"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+
+  # ATA/SATA via hdparm security (only on sdX, not via most USB bridges)
+  if have_cmd hdparm; then
+    case "$(basename "$DEVICE" 2>/dev/null)" in
+      sd*)
+        hdparm -I "$DEVICE" >"$SESSION_DIR/hdparm.ident" 2>&1 || true
+        if grep -qi "^Security:" "$SESSION_DIR/hdparm.ident"; then
+          if grep -qi "frozen" "$SESSION_DIR/hdparm.ident"; then
+            SAN_SUPPORTED="false"
+            SAN_REASON="security_frozen"
+          else
+            if grep -qi "enhanced erase" "$SESSION_DIR/hdparm.ident"; then
+              SAN_SUPPORTED="true"; SAN_SELECTED_METHOD="ata_sec_erase_enh"; return 0
+            else
+              SAN_SUPPORTED="true"; SAN_SELECTED_METHOD="ata_sec_erase"; return 0
+            fi
+          fi
+        fi
+        ;;
+    esac
+  fi
+
+  # SCSI/SAS via sg_sanitize (crypto)
+  if have_cmd sg_sanitize; then
+    case "$(basename "$DEVICE" 2>/dev/null)" in
+      sd*)
+        SAN_SUPPORTED="true"
+        SAN_SELECTED_METHOD="scsi_sanitize_crypto"
+        return 0
+        ;;
+    esac
+  fi
+
+  SAN_SUPPORTED="false"
+}
+
+_confirm_post_sanitize() {
+  # Returns 0 if approved
+  if [ "$POST_SANITIZE" = "force" ]; then
+    return 0
+  fi
+  printf '\n%sPOST-SANITIZE OPTION%s\n' "$BLD" "$RST"
+  printf 'A firmware-level erase (%s) is supported on this device.\n' "$SAN_SELECTED_METHOD"
+  printf 'This will change device contents after the random pass and may take additional time.\n'
+  printf 'Proceed with firmware sanitize now? Type YES to continue: '
+  read ans || ans=""
+  [ "$ans" = "YES" ]
+}
+
+perform_post_sanitize() {
+  # Only run if:
+  #  * User allowed via POST_SANITIZE (auto/force), and
+  #  * A random-data pass was performed (per requirement), OR forced
+  #
+  # On success, sets:
+  #   SAN_RESULT="ok"
+  # On skip/failure, sets:
+  #   SAN_RESULT="skipped" or "failed"; SAN_REASON filled.
+  #
+  # Running this invalidates content-based verification; we mark verify as skipped(post-sanitize).
+
+  case "$POST_SANITIZE" in
+    never) SAN_RESULT="skipped"; SAN_REASON="policy_never"; return 0 ;;
+  esac
+
+  # Must have random pattern in the wipe sequence unless forced
+  ran_random="no"
+  case "$PATTERN" in
+    random) ran_random="yes" ;;
+    sequence) ran_random="no" ;;
+    *) ran_random="no" ;;
+  esac
+  if [ "$POST_SANITIZE" != "force" ] && [ "$ran_random" != "yes" ]; then
+    SAN_RESULT="skipped"; SAN_REASON="no_random_pass"
+    return 0
+  fi
+
+  detect_sanitize_support
+  if [ "$SAN_SUPPORTED" != "true" ] || [ -z "$SAN_SELECTED_METHOD" ]; then
+    SAN_RESULT="skipped"; SAN_REASON="${SAN_REASON:-unsupported}"
+    return 0
+  fi
+
+  if [ "$POST_SANITIZE" = "auto" ]; then
+    _confirm_post_sanitize || { SAN_RESULT="skipped"; SAN_REASON="declined"; return 0; }
+  fi
+
+  case "$SAN_SELECTED_METHOD" in
+    nvme_format_s1)
+      if [ "$DRY_RUN" -eq 1 ]; then
+        SAN_RESULT="skipped"; SAN_REASON="dry_run"
+      else
+        if nvme format "$DEVICE" -s1 >/dev/null 2>&1; then
+          SAN_RESULT="ok"
+        else
+          SAN_RESULT="failed"; SAN_REASON="nvme_format_error"
+          append_error "nvme format -s1 failed"
+        fi
+      fi
+      ;;
+
+    ata_sec_erase_enh)
+      if [ "$DRY_RUN" -eq 1 ]; then
+        SAN_RESULT="skipped"; SAN_REASON="dry_run"
+      else
+        if hdparm --user-master u --security-set-pass p "$DEVICE" >/dev/null 2>&1; then
+          if hdparm --user-master u --security-erase-enhanced p "$DEVICE" >/dev/null 2>&1; then
+            SAN_RESULT="ok"
+          else
+            SAN_RESULT="failed"; SAN_REASON="hdparm_erase_enh_failed"
+            append_error "hdparm security-erase-enhanced failed"
+          fi
+          hdparm --user-master u --security-disable p "$DEVICE" >/dev/null 2>&1 || true
+        else
+          SAN_RESULT="failed"; SAN_REASON="hdparm_set_pass_failed"
+          append_error "hdparm security-set-pass failed"
+        fi
+      fi
+      ;;
+
+    ata_sec_erase)
+      if [ "$DRY_RUN" -eq 1 ]; then
+        SAN_RESULT="skipped"; SAN_REASON="dry_run"
+      else
+        if hdparm --user-master u --security-set-pass p "$DEVICE" >/dev/null 2>&1; then
+          if hdparm --user-master u --security-erase p "$DEVICE" >/dev/null 2>&1; then
+            SAN_RESULT="ok"
+          else
+            SAN_RESULT="failed"; SAN_REASON="hdparm_erase_failed"
+            append_error "hdparm security-erase failed"
+          fi
+          hdparm --user-master u --security-disable p "$DEVICE" >/dev/null 2>&1 || true
+        else
+          SAN_RESULT="failed"; SAN_REASON="hdparm_set_pass_failed"
+          append_error "hdparm security-set-pass failed"
+        fi
+      fi
+      ;;
+
+    scsi_sanitize_crypto)
+      if [ "$DRY_RUN" -eq 1 ]; then
+        SAN_RESULT="skipped"; SAN_REASON="dry_run"
+      else
+        if sg_sanitize --crypto "$DEVICE" >/dev/null 2>&1; then
+          SAN_RESULT="ok"
+        else
+          SAN_RESULT="failed"; SAN_REASON="sg_sanitize_failed"
+          append_error "sg_sanitize --crypto failed"
+        fi
+      fi
+      ;;
+  esac
+
+  if [ "$SAN_RESULT" = "ok" ]; then
+    HASH_VERIFY="none"
+    VERIFY_PASSED="skipped(post-sanitize)"
+  fi
+}
+
+#############################################################################
 # Inventory logging / Signing / Export
 #############################################################################
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'; }
@@ -1190,6 +1411,12 @@ write_json_report() {
       "$(date -u -d @"$start_t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)" \
       "$(date -u -d @"$end_t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf '  "duration_sec": %s,\n' "$dur"
+    printf '  "post_sanitize": {"policy":"%s","supported":%s,"method":"%s","result":"%s","reason":"%s"},\n' \
+      "$(json_escape "$POST_SANITIZE")" \
+      "$( [ "$SAN_SUPPORTED" = "true" ] && printf true || printf false )" \
+      "$(json_escape "$SAN_SELECTED_METHOD")" \
+      "$(json_escape "$SAN_RESULT")" \
+      "$(json_escape "$SAN_REASON")"
     printf '  "inventory_appended": %s,\n' "$( [ "$INV_APPENDED" = "true" ] && printf true || printf false )"
     printf '  "signatures": {"gpg_sig_path": %s},\n' "$( [ -n "$GPG_SIG_PATH" ] && printf '"%s"' "$(json_escape "$GPG_SIG_PATH")" || printf null )"
     printf '  "exported_archive": %s\n' "$( [ "$EXPORT_LOGS" -eq 1 ] && printf '"%s/session-%s.tar.gz"' "$(json_escape "$LOG_DIR")" "$(json_escape "$TS")" || printf null )"
@@ -1207,6 +1434,13 @@ human_summary() {
   printf 'USB Device %sSummary%s\n' "$BLD" "$RST"
   printf 'Device: %s  Model: %s  VID:PID=%s:%s\n' "$DEVICE" "${MODEL:-unknown}" "${VENDOR_ID:-????}" "${PRODUCT_ID:-????}"
   printf 'Serial: %s  Size: %s (%s)\n' "${SERIAL:-unknown}" "$SIZE_BYTES" "$(human_bytes "$SIZE_BYTES")"
+  if [ "$SAN_RESULT" = "ok" ]; then
+    printf 'Post-sanitize: %s (%s)\n' "$SAN_RESULT" "$SAN_SELECTED_METHOD"
+  else
+    printf 'Post-sanitize: %s' "$SAN_RESULT"
+    [ -n "$SAN_REASON" ] && printf ' [%s]' "$SAN_REASON"
+    printf '\n'
+  fi
   printf 'Geometry: %s logical / %s physical  ROTA: %s\n' "${SECTOR_LOGICAL:-?}" "${SECTOR_PHYSICAL:-?}" "${ROTA:-?}"
   printf 'Partitions (%s)  Filesystems: %s\n' "${TABLE_TYPE:-unknown}" "$(printf '%s' "$FS_LIST")"
   printf 'Read-only: %s\n' "$( [ "$RO_FLAG" = "1" ] && printf 'yes' || printf 'no/unknown' )"
@@ -1325,7 +1559,10 @@ mode_wipe() {
 
   flush_buffers
 
-  # Verification
+  # Optional firmware-level sanitize after random pass (if supported/policy allows)
+  perform_post_sanitize
+
+  # Verification (may be skipped if post-sanitize modified contents)
   if verify_after_wipe; then
     ok "Verification PASSED."
   else
@@ -1403,4 +1640,3 @@ exit 0
 #   * Composite detection best-effort via lsusb (Linux).
 #   * Hidden area checks often blocked by USB-SATA bridges.
 #############################################################################
-
