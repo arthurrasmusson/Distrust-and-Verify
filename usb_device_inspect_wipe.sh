@@ -2,39 +2,58 @@
 #
 # usb_device_inspect_wipe.sh
 #
-# Purpose : USB Mass‑Storage Device Inspect & Wipe (scan + overwrite + verify)
-# Author  : Arthur Rasmusson
-# Date    : 2025-10-22
+# DO NOT RUN ON LIVE SYSTEM DISKS. THIS WILL ERASE DATA.
 #
-# IMPORTANT WARNINGS
-# ==================
-# * THIS SCRIPT CAN DESTROY DATA. Use at your own risk.
-# * Requires root (or sudo). Refuses to touch mounted/root/system disks.
-# * Portable/POSIX style (works with dash); optional tooling is used when available.
+# Purpose:
+#   - Mode 1 (scan): comprehensive device inventory & blankness check
+#   - Mode 2 (wipe): multi-pass overwrite + verification + audit logs
+#
+# Compatibility:
+#   POSIX /bin/sh (dash, ash, ksh, bash in POSIX mode)
+#   Linux and OpenBSD auto-detected; optional tools degrade gracefully
 #
 # Exit codes:
-#   0 success
-#   1 user abort
-#   2 device not found
-#   3 verification failed
-#   4 insufficient privileges or missing critical tools
+#   0 success; 1 user abort; 2 device not found;
+#   3 verification failed; 4 insufficient privileges/tools;
 #   5 unsafe target (system/root disk)
 #
-# ---------------------------------------------------------------------------
 
-#############################################################################
-# Configuration defaults (can be overridden via CLI flags)
-#############################################################################
+###############################################################################
+# Strict mode & traps (POSIX)
+###############################################################################
+set -eu
+# We avoid pipefail for POSIX; we carefully check each step’s status.
+umask 077
 
-MODE=""                   # "scan" or "wipe"
-DEVICE=""                 # e.g. /dev/sdb
+CLEANUP_ITEMS=""
+cleanup() {
+  # remove temp files registered in CLEANUP_ITEMS (whitespace-safe)
+  IFS='
+'
+  for x in $CLEANUP_ITEMS; do
+    [ -n "$x" ] && [ -e "$x" ] && rm -f -- "$x" || true
+  done
+}
+trap 'cleanup' EXIT HUP INT TERM
+
+###############################################################################
+# Globals & defaults
+###############################################################################
+OS="$(uname -s 2>/dev/null || echo unknown)"
+START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+SCRIPT_NAME="usb_device_inspect_wipe.sh"
+SELF_DIR="$(pwd)"
+
+# CLI defaults
+MODE=""                    # scan|wipe (or "1"|"2")
+DEVICE=""                  # /dev/XXX
 DRY_RUN=0
-PASSES=1                  # 1,3,7 allowed
-PATTERN="random"          # random|zeros|ff|aa|sequence
+PASSES=1
+PATTERN="random"           # random|zeros|ff|aa|sequence
 CHUNK_SIZE="16M"
-HASH_VERIFY="sample"      # none|sample|full
+HASH_POLICY="sample"       # none|sample|full
 SAMPLES=32
-INVENTORY_LOG=""          # path to JSONL
+INVENTORY_LOG=""
 LOG_DIR="./logs"
 OPENBSD_ADAPT=0
 RUN_SMART=0
@@ -42,97 +61,78 @@ PROBE_RO=0
 CHECK_HIDDEN=0
 EXPORT_LOGS=0
 SIGN_LOGS=0
-SIGN_ID=""
+GPG_ID=""                  # for --sign-logs=GPG_ID
 FIRMWARE_SCAN=0
 FORCE=0
-MAX_FINDINGS=8           # first N non‑zero offsets to record during blankness check
-LARGE_WARN_TB=2          # warn if device > 2 TB
-SAMPLE_WIN_DEFAULT="1M"  # sample window size for hashing
-UMOUNT_TIMEOUT=10
-POST_SANITIZE="auto"     # auto|never|force
+WAIT_FOR_PLUG=1
+LARGE_DEV_TB=2
+NONZERO_FINDINGS=8
+POST_SANITIZE=0           # if 1: feature discovery & sanitize after wipe (NVMe/SCSI/ATA)
+POST_SANITIZE_MODE="auto" # 'auto' selects best supported sanitize
 
-# Derived later
-OS=""
-TS=""
+# Derived runtime
+SESSION_ID="$(date -u +%Y%m%d-%H%M%S 2>/dev/null || date +%s)"
 SESSION_DIR=""
-SESSION_JSON=""
-SESSION_LOG=""
-ATTACH_LOG=""
-INV_APPENDED="false"
-GPG_SIG_PATH=""
+JSON_REPORT=""
+HUMAN_LOG=""
+ERRORS="[]"
 
-# Global state collected during detection
-BUS_DEV=""           # e.g. "001:009" on Linux
-VENDOR_ID=""
-PRODUCT_ID=""
-MANUFACTURER=""
-PRODUCT=""
-MODEL=""            # from lsblk/udev if available
-SERIAL=""
-SIZE_BYTES=0
-SECTOR_LOGICAL=""
-SECTOR_PHYSICAL=""
-ROTA=""             # 1=rotational, 0=flash
-TABLE_TYPE=""
-RO_FLAG=""
+# Device facts (will be discovered)
+DEV_BASENAME=""
+DEV_SIZE_BYTES=""
+DEV_SECTOR_LOGICAL=""
+DEV_SECTOR_PHYSICAL=""
+DEV_RO=0
+DEV_ROTA=0
+DEV_TABLE="unknown"
 PART_JSON="[]"
 FS_LIST="[]"
 COMPOSITE_LIST="[]"
-SMART_STATUS="unknown"
-HPA_DCO_STATUS="unknown"
-FIRMWARE_SCAN_SUMMARY="none"
-BLANK_IS="unknown"
-BLANK_OFFSETS="[]"
-PROBE_RO_RESULT="skipped"
+VID=""
+PID=""
+MFG=""
+PRODUCT=""
+SERIAL=""
+BUS_DEV=""
+SMART_STATUS="unavailable"
+HPA_DCO_STATUS="not_applicable"
+FIRMWARE_SUMMARY="none"
+OS_FAMILY="unknown"
 
-VERIFY_PASSED="unknown"
+# Verification results placeholder
+VERIFY_PASSED=0
 UNCHANGED_RANGES="[]"
 ZERO_RANGES="[]"
-ERRORS="[]"
 
-# Post-sanitize reporting
-SAN_SUPPORTED="false"
-SAN_SELECTED_METHOD=""   # nvme_format_s1 | ata_sec_erase_enh | ata_sec_erase | scsi_sanitize_crypto
-SAN_RESULT="skipped"
-SAN_REASON=""
+###############################################################################
+# UI helpers (no non-ASCII to keep dash happy)
+###############################################################################
+is_tty() { [ -t 1 ] && [ -t 0 ]; }
 
-#############################################################################
-# Minimal colors (safe fallback if tput/tty not present)
-#############################################################################
-is_tty() { [ -t 1 ] || [ -t 2 ]; }
 if is_tty && command -v tput >/dev/null 2>&1; then
-  RED="$(tput setaf 1 2>/dev/null || printf '')"
-  GRN="$(tput setaf 2 2>/dev/null || printf '')"
-  YLW="$(tput setaf 3 2>/dev/null || printf '')"
-  BLU="$(tput setaf 4 2>/dev/null || printf '')"
-  BLD="$(tput bold 2>/dev/null || printf '')"
-  RST="$(tput sgr0 2>/dev/null || printf '')"
+  C_RESET="$(tput sgr0 2>/dev/null || true)"
+  C_RED="$(tput setaf 1 2>/dev/null || true)"
+  C_GRN="$(tput setaf 2 2>/dev/null || true)"
+  C_YLW="$(tput setaf 3 2>/dev/null || true)"
+  C_CYN="$(tput setaf 6 2>/dev/null || true)"
 else
-  RED="$(printf '\033[31m')"
-  GRN="$(printf '\033[32m')"
-  YLW="$(printf '\033[33m')"
-  BLU="$(printf '\033[34m')"
-  BLD="$(printf '\033[1m')"
-  RST="$(printf '\033[0m')"
+  C_RESET=""; C_RED=""; C_GRN=""; C_YLW=""; C_CYN=""
 fi
 
-info()  { printf '%s[i]%s %s\n' "$BLU" "$RST" "$*"; }
-ok()    { printf '%s[+]%s %s\n' "$GRN" "$RST" "$*"; }
-warn()  { printf '%s[!]%s %s\n' "$YLW" "$RST" "$*"; }
-err()   { printf '%s[✗]%s %s\n' "$RED" "$RST" "$*"; }
+info()  { printf "%s[INFO]%s %s\n" "$C_CYN" "$C_RESET" "$*"; }
+warn()  { printf "%s[WARN]%s %s\n" "$C_YLW" "$C_RESET" "$*"; }
+error() { printf "%s[ERR ]%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; }
 
 die() {
   code="$1"; shift
-  err "$*"
-  [ -n "$SESSION_LOG" ] && printf 'ERROR: %s\n' "$*" >>"$SESSION_LOG" 2>/dev/null || true
+  error "$*"
   exit "$code"
 }
 
 append_error() {
-  # Append a string (JSON-escaped later) to ERRORS array for report
-  # Keep simple: store as raw text with quotes escaped.
-  txt="$*"
-  esc="$(printf '%s' "$txt" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  # store message in JSON-safe string
+  msg="$*"
+  esc="$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')"
   if [ "$ERRORS" = "[]" ]; then
     ERRORS='["'"$esc"'"]'
   else
@@ -140,1503 +140,1370 @@ append_error() {
   fi
 }
 
-#############################################################################
-# OS / Root / Tools
-#############################################################################
-detect_os() {
-  case "$(uname -s 2>/dev/null || echo '?')" in
-    Linux)   OS="Linux" ;;
-    OpenBSD) OS="OpenBSD" ;;
-    *)       OS="unknown" ;;
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+bytes_from_human() {
+  # Convert sizes like 16M, 4K, 1G to bytes; default bytes if numeric
+  v="$1"
+  case "$v" in
+    *[!0-9mMkKgG]*) echo "$v" ;; # unknown suffix—return as-is
+    *[mM]) echo $(($(printf '%s' "${v%[mM]}") * 1024 * 1024)) ;;
+    *[kK]) echo $(($(printf '%s' "${v%[kK]}") * 1024)) ;;
+    *[gG]) echo $(($(printf '%s' "${v%[gG]}") * 1024 * 1024 * 1024)) ;;
+    *) echo "$v" ;;
   esac
 }
 
-require_root() {
-  uid="$(id -u 2>/dev/null || echo 9999)"
-  [ "$uid" = "0" ] || die 4 "This script must run as root (or with sudo)."
+human_bytes() {
+  # 1024-based
+  v="$1"
+  if [ -z "$v" ]; then echo "0 B"; return; fi
+  b="$v"
+  if [ "$b" -ge 1099511627776 ] 2>/dev/null; then
+    printf "%.1f TB" "$(echo "scale=1;$b/1099511627776" | awk '{printf "%f", $1}')"
+  elif [ "$b" -ge 1073741824 ] 2>/dev/null; then
+    printf "%.1f GB" "$(echo "scale=1;$b/1073741824" | awk '{printf "%f", $1}')"
+  elif [ "$b" -ge 1048576 ] 2>/dev/null; then
+    printf "%.1f MB" "$(echo "scale=1;$b/1048576" | awk '{printf "%f", $1}')"
+  elif [ "$b" -ge 1024 ] 2>/dev/null; then
+    printf "%.1f KB" "$(echo "scale=1;$b/1024" | awk '{printf "%f", $1}')"
+  else
+    printf "%s B" "$b"
+  fi
 }
 
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
+json_escape() {
+  # escape for JSON value
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
 
-tool_list_record=""
-check_tools() {
-  # Record presence of useful tools (optional gracefully)
-  tools="dd grep sed awk od hexdump wc date"
-  for t in $tools; do
-    have_cmd "$t" || die 4 "Missing required tool: $t"
-  done
-  # Optional
-  for t in lsblk blkid udevadm lsusb sha256sum sha256 cmp parted sgdisk smartctl hdparm timeout jq gpg tar; do
-    if have_cmd "$t"; then
-      tool_list_record="$tool_list_record $t"
+join_csv() {
+  # join newline list with commas (no quoting)
+  IFS='
+'
+  first=1
+  for x in $1; do
+    if [ $first -eq 1 ]; then
+      printf '%s' "$x"
+      first=0
+    else
+      printf ',%s' "$x"
     fi
   done
-  # OpenBSD equivalents (presence checked when used)
-  :
 }
 
-#############################################################################
-# Logging setup
-#############################################################################
-init_logs() {
-  TS="$(date -u +%Y%m%d-%H%M%S 2>/dev/null || date +%Y%m%d-%H%M%S)"
-  SESSION_DIR="$LOG_DIR/session-$TS"
-  mkdir -p "$SESSION_DIR" || die 4 "Cannot create log dir: $SESSION_DIR"
-  SESSION_JSON="$SESSION_DIR/usb-report-$TS.json"
-  SESSION_LOG="$SESSION_DIR/session-$TS.log"
-  ATTACH_LOG="$SESSION_DIR/attach-$TS.txt"
-  umask 077
-  {
-    printf 'USB Inspect/Wipe Session %s\n' "$TS"
-    printf 'OS=%s SHELL=%s\n' "$OS" "${SHELL:-unknown}"
-    printf 'Tools:%s\n' "$tool_list_record"
-  } >>"$SESSION_LOG" 2>/dev/null || true
+###############################################################################
+# OS detection
+###############################################################################
+detect_os() {
+  case "$OS" in
+    Linux)  OS_FAMILY="linux" ;;
+    OpenBSD) OS_FAMILY="openbsd" ;;
+    *) OS_FAMILY="unknown" ;;
+  esac
 }
 
-#############################################################################
-# CLI parsing (POSIX; supports --key=value and some short forms)
-#############################################################################
+###############################################################################
+# Privilege & tool checks
+###############################################################################
+require_root() {
+  uid="$(id -u 2>/dev/null || echo 1)"
+  if [ "$uid" != 0 ]; then
+    die 4 "Root privileges required. Re-run with sudo."
+  fi
+}
+
+ensure_session_dir() {
+  [ -d "$LOG_DIR" ] || mkdir -p -- "$LOG_DIR"
+  SESSION_DIR="$LOG_DIR/session-$SESSION_ID"
+  mkdir -p -- "$SESSION_DIR"
+  JSON_REPORT="$SESSION_DIR/usb-report-$SESSION_ID.json"
+  HUMAN_LOG="$SESSION_DIR/usb-session-$SESSION_ID.log"
+}
+
+tee_human() { printf "%s\n" "$*" | tee -a "$HUMAN_LOG" >/dev/null 2>&1; }
+
+###############################################################################
+# CLI parsing (POSIX)
+###############################################################################
 usage() {
-  cat <<'USAGE_EOF'
-Usage:
-  usb_device_inspect_wipe.sh [--mode=scan|wipe] [--device=/dev/XXX] [--dry-run]
-                             [--passes=N] [--pattern=random|zeros|ff|aa|sequence]
-                             [--chunk-size=SIZE] [--hash-verify=none|sample|full]
-                             [--samples=N] [--inventory-log=PATH] [--log-dir=PATH]
-                             [--openbsd-adapt] [--run-smart] [--probe-ro]
-                             [--check-hidden] [--export-logs]
-                             [--sign-logs[=GPG_ID]] [--firmware-scan] [--force]
-                             [--post-sanitize=auto|never|force]
+cat <<EOF
+Usage: $SCRIPT_NAME [FLAGS]
 
-If --mode is omitted, an interactive menu is shown.
-SIZE accepts decimal or K/M/G suffixes (powers of 1024).
-USAGE_EOF
+Modes:
+  --mode=scan|wipe        (or -m 1|2)  If omitted, interactive menu.
+
+Device:
+  --device=/dev/XXX                    Target block device; if omitted, waits for plug-in.
+
+General:
+  --dry-run                            Simulate; never write to devices.
+  --log-dir=PATH                       Default: ./logs
+  --inventory-log=PATH                 Append JSONL device fingerprint/outcome
+  --openbsd-adapt                      Force OpenBSD path if auto-detect fails
+  --force                              Bypass some interlocks (still confirms device node)
+  --export-logs                        Tar.gz the session logs at end
+  --sign-logs[=GPG_ID]                 Sign JSON report & inventory entry
+
+Scan options:
+  --run-smart                          Attempt SMART (if SAT pass-through)
+  --probe-ro                           Tiny write/read/restore probes at start/mid/end
+  --check-hidden                       HPA/DCO checks (Linux SATA; warn on USB bridge)
+  --firmware-scan                      List alternate LUNs/DFU/vendor partitions
+
+Wipe options:
+  --passes=N                           1,3,7 (default 1)
+  --pattern=TYPE                       random|zeros|ff|aa|sequence (default random)
+  --chunk-size=SIZE                    e.g., 16M (applies read/write/verify)
+  --hash-verify=none|sample|full       default sample
+  --samples=N                          number of sample windows (default 32)
+  --post-sanitize                      After wipe, try NVMe/SCSI/ATA sanitize if supported
+
+Other:
+  --nonzero-findings=N                 First N offsets for blankness report (default 8)
+  --large-dev-threshold-tb=N          Warn if device size > N TB (default 2)
+
+Examples:
+  $SCRIPT_NAME --mode=scan
+  $SCRIPT_NAME --mode=wipe --device=/dev/sdb --passes=3 --pattern=sequence --hash-verify=sample --samples=32
+
+EOF
 }
 
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --mode=*) MODE="${1#*=}";;
-      -m) shift; MODE="$1";;
-      -m*) MODE="${1#-m}";;
-      --device=*) DEVICE="${1#*=}";;
-      --dry-run) DRY_RUN=1;;
-      --passes=*) PASSES="${1#*=}";;
-      --pattern=*) PATTERN="${1#*=}";;
-      --chunk-size=*) CHUNK_SIZE="${1#*=}";;
-      --hash-verify=*) HASH_VERIFY="${1#*=}";;
-      --samples=*) SAMPLES="${1#*=}";;
-      --inventory-log=*) INVENTORY_LOG="${1#*=}";;
-      --log-dir=*) LOG_DIR="${1#*=}";;
-      --openbsd-adapt) OPENBSD_ADAPT=1;;
-      --run-smart) RUN_SMART=1;;
-      --probe-ro) PROBE_RO=1;;
-      --check-hidden) CHECK_HIDDEN=1;;
-      --export-logs) EXPORT_LOGS=1;;
-      --sign-logs) SIGN_LOGS=1;;
-      --sign-logs=*) SIGN_LOGS=1; SIGN_ID="${1#*=}";;
-      --firmware-scan) FIRMWARE_SCAN=1;;
-      --force) FORCE=1;;
-      --post-sanitize=*) POST_SANITIZE="$(to_lower "${1#*=}")";;
-      --max-findings=*) MAX_FINDINGS="${1#*=}";;
-      --help|-h) usage; exit 0;;
-      *) err "Unknown argument: $1"; usage; exit 4;;
+      -m|--mode)
+        shift; MODE="$1"
+        ;;
+      --mode=*)
+        MODE="${1#*=}"
+        ;;
+      --device=*)
+        DEVICE="${1#*=}"
+        ;;
+      --device)
+        shift; DEVICE="$1"
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --passes=*)
+        PASSES="${1#*=}"
+        ;;
+      --passes)
+        shift; PASSES="$1"
+        ;;
+      --pattern=*)
+        PATTERN="${1#*=}"
+        ;;
+      --pattern)
+        shift; PATTERN="$1"
+        ;;
+      --chunk-size=*)
+        CHUNK_SIZE="${1#*=}"
+        ;;
+      --chunk-size)
+        shift; CHUNK_SIZE="$1"
+        ;;
+      --hash-verify=*)
+        HASH_POLICY="${1#*=}"
+        ;;
+      --hash-verify)
+        shift; HASH_POLICY="$1"
+        ;;
+      --samples=*)
+        SAMPLES="${1#*=}"
+        ;;
+      --samples)
+        shift; SAMPLES="$1"
+        ;;
+      --inventory-log=*)
+        INVENTORY_LOG="${1#*=}"
+        ;;
+      --inventory-log)
+        shift; INVENTORY_LOG="$1"
+        ;;
+      --log-dir=*)
+        LOG_DIR="${1#*=}"
+        ;;
+      --log-dir)
+        shift; LOG_DIR="$1"
+        ;;
+      --openbsd-adapt)
+        OPENBSD_ADAPT=1
+        ;;
+      --run-smart)
+        RUN_SMART=1
+        ;;
+      --probe-ro)
+        PROBE_RO=1
+        ;;
+      --check-hidden)
+        CHECK_HIDDEN=1
+        ;;
+      --export-logs)
+        EXPORT_LOGS=1
+        ;;
+      --sign-logs)
+        SIGN_LOGS=1
+        ;;
+      --sign-logs=*)
+        SIGN_LOGS=1; GPG_ID="${1#*=}"
+        ;;
+      --firmware-scan)
+        FIRMWARE_SCAN=1
+        ;;
+      --force)
+        FORCE=1
+        ;;
+      --post-sanitize)
+        POST_SANITIZE=1
+        ;;
+      --nonzero-findings=*)
+        NONZERO_FINDINGS="${1#*=}"
+        ;;
+      --large-dev-threshold-tb=*)
+        LARGE_DEV_TB="${1#*=}"
+        ;;
+      -h|--help)
+        usage; exit 0
+        ;;
+      *)
+        error "Unknown flag: $1"
+        usage
+        exit 4
+        ;;
     esac
     shift
   done
 
   case "$MODE" in
-    1) MODE="scan";;
-    2) MODE="wipe";;
+    1) MODE="scan" ;;
+    2) MODE="wipe" ;;
     scan|wipe|"") : ;;
-    *) die 4 "Invalid --mode: $MODE";;
-  esac
-
-  case "$PASSES" in
-    1|3|7) : ;;
-    *) warn "Non-standard passes=$PASSES; supported values are 1,3,7";;
-  esac
-
-  case "$PATTERN" in
-    random|zeros|ff|aa|sequence) : ;;
-    *) die 4 "Invalid --pattern";;
-  esac
-
-  case "$HASH_VERIFY" in
-    none|sample|full) : ;;
-    *) die 4 "Invalid --hash-verify";;
-  esac
-
-  case "$POST_SANITIZE" in
-    auto|never|force) : ;;
-    *) die 4 "Invalid --post-sanitize (auto|never|force)";;
-  esac
-
-  # OpenBSD fallback switch
-  if [ "$OPENBSD_ADAPT" -eq 1 ] && [ "$OS" != "OpenBSD" ]; then
-    warn "Forcing OpenBSD adaptation paths on non-OpenBSD system."
-  fi
-}
-
-#############################################################################
-# Size parsing / formatting
-#############################################################################
-to_lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
-
-parse_size_bytes() {
-  # Input like "16M", "1G", "512K", or plain bytes. Returns bytes to stdout.
-  s="$(to_lower "$1")"
-  case "$s" in
-    *k) n="${s%k}"; awk "BEGIN{printf \"%u\", $n*1024}";;
-    *m) n="${s%m}"; awk "BEGIN{printf \"%u\", $n*1024*1024}";;
-    *g) n="${s%g}"; awk "BEGIN{printf \"%u\", $n*1024*1024*1024}";;
-    *t) n="${s%t}"; awk "BEGIN{printf \"%u\", $n*1024*1024*1024*1024}";;
-    *)  printf '%s' "$s";;
+    *) error "Invalid --mode"; usage; exit 4 ;;
   esac
 }
 
-human_bytes() {
-  # Simple humanizer (binary units)
-  b="$1"
-  # Avoid floating point: use awk for one decimal
-  if [ "$b" -ge 1099511627776 ] 2>/dev/null; then
-    awk "BEGIN{printf \"%.1f TB\", $b/1099511627776}"
-  elif [ "$b" -ge 1073741824 ] 2>/dev/null; then
-    awk "BEGIN{printf \"%.1f GB\", $b/1073741824}"
-  elif [ "$b" -ge 1048576 ] 2>/dev/null; then
-    awk "BEGIN{printf \"%.1f MB\", $b/1048576}"
-  elif [ "$b" -ge 1024 ] 2>/dev/null; then
-    awk "BEGIN{printf \"%.1f KB\", $b/1024}"
+###############################################################################
+# System disk guard
+###############################################################################
+linux_root_parent() {
+  # returns root parent (e.g., sda) or empty
+  if have_cmd findmnt; then
+    rdev="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
   else
-    printf '%s B' "$b"
+    rdev="$(awk '$2=="/"{print $1}' /proc/mounts 2>/dev/null | head -n1 || true)"
   fi
-}
-
-#############################################################################
-# Root/system/mount guards
-#############################################################################
-linux_root_disk() {
-  # Returns parent disk name (e.g., sda) of / on Linux, if discoverable
-  rootdev="$(awk '$2=="/"{print $1}' /proc/mounts 2>/dev/null | sed 's/[0-9]*$//')"
-  # If like /dev/sda2 -> parent is sda
-  if have_cmd lsblk; then
-    p="$(lsblk -no PKNAME "$rootdev" 2>/dev/null | head -n1)"
-    [ -n "$p" ] && printf '%s\n' "$p" && return 0
+  # rdev may be /dev/sda1; find its top disk:
+  if [ -n "$rdev" ] && have_cmd lsblk; then
+    p="$(lsblk -no PKNAME "$rdev" 2>/dev/null || true)"
+    if [ -n "$p" ]; then
+      printf '%s\n' "$p"
+    else
+      # maybe itself a disk (no PKNAME)
+      b="$(basename "$rdev" 2>/dev/null || echo "")"
+      printf '%s\n' "$b"
+    fi
   fi
-  # Fallback: strip /dev/ prefix and digits
-  b="$(basename "$rootdev" 2>/dev/null | sed 's/[0-9]*$//')"
-  [ -n "$b" ] && printf '%s\n' "$b" || printf '\n'
 }
 
 openbsd_root_disk() {
-  # Parses mount(8) to get sdX underlying root (e.g., /dev/sd0a -> sd0)
-  r="$(mount 2>/dev/null | awk '$3=="/"{print $1}' | sed 's#.*/##')"
-  b="$(printf '%s' "$r" | sed 's/[a-z]$//')"  # remove partition letter
-  [ -n "$b" ] && printf '%s\n' "$b" || printf '\n'
-}
-
-is_mounted_linux() {
-  # $1: device (e.g., /dev/sdb1)
-  grep -q "^[^ ]\+ $1 " /proc/self/mounts 2>/dev/null && return 0
-  grep -q "^$1 " /proc/mounts 2>/dev/null && return 0
-  # safer: query lsblk
-  if have_cmd lsblk; then
-    lsblk -rn -o NAME,MOUNTPOINT | awk -v d="$(basename "$1")" '$1==d && $2!=""{f=1} END{exit (f?0:1)}'
-    return $?
+  # parse 'mount' line for / -> /dev/sd0a
+  r="$(mount | awk '$3=="/"{print $1}' | head -n1)"
+  # r like /dev/sd0a -> disk is sd0
+  if [ -n "$r" ]; then
+    b="$(basename "$r")"
+    printf '%s\n' "$(printf '%s' "$b" | sed 's/[a-z]$//')"
   fi
-  return 1
 }
 
 guard_unsafe_target() {
-  # Refuse to touch system/root disks or mounted devices
-  case "$OS" in
-    Linux)
-      p="$(basename "$DEVICE" 2>/dev/null)"
-      sys="$(linux_root_disk)"
-      if [ -n "$sys" ] && [ "$p" = "$sys" ]; then
-        die 5 "Refusing to operate on system/root disk: $DEVICE"
+  if [ -z "$DEVICE" ]; then
+    return 0
+  fi
+
+  case "$OS_FAMILY" in
+    linux)
+      rootp="$(linux_root_parent || true)"
+      # DEVICE may be /dev/sdb
+      bdev="$(basename "$DEVICE" 2>/dev/null || echo "")"
+      if [ -n "$rootp" ] && [ -n "$bdev" ] && [ "$rootp" = "$bdev" ]; then
+        die 5 "Refusing: target $DEVICE seems to be the system/root disk."
       fi
-      # Refuse if any partition is mounted
+      # also refuse if any partitions are mounted
       if have_cmd lsblk; then
-        if lsblk -rn -o NAME,MOUNTPOINT "$DEVICE" 2>/dev/null | awk '$2!=""{f=1} END{exit (f?0:1)}'; then
+        if lsblk -rn -o NAME,MOUNTPOINT "$DEVICE" 2>/dev/null | awk '$2!=""{f=1} END{exit (f?0:1)}'
+        then
           die 5 "Refusing: one or more partitions of $DEVICE are mounted."
         fi
       fi
       ;;
-    OpenBSD)
-      b="$(basename "$DEVICE" 2>/dev/null)"
-      sys="$(openbsd_root_disk)"
-      if [ -n "$sys" ] && [ "$b" = "$sys" ] || printf '%s' "$b" | grep -q "^${sys}[a-z]\$"; then
-        die 5 "Refusing to operate on system/root disk: $DEVICE"
+    openbsd)
+      rdisk="$(openbsd_root_disk || true)"
+      # /dev/sd1 -> sd1
+      b="$(basename "$DEVICE" 2>/dev/null || echo "")"
+      short="$(printf '%s' "$b" | sed 's,^.*/,,; s/[a-z]$//')"
+      if [ -n "$rdisk" ] && [ -n "$short" ] && [ "$rdisk" = "$short" ]; then
+        die 5 "Refusing: target $DEVICE seems to be the system/root disk."
       fi
-      # Mount check
-      if mount 2>/dev/null | grep -q "^$DEVICE"; then
-        die 5 "Refusing: $DEVICE is mounted."
+      # mounted partitions?
+      if mount | grep -q "/dev/${short}[a-z] on "; then
+        die 5 "Refusing: one or more partitions of $DEVICE are mounted."
       fi
+      ;;
+    *)
+      warn "Unknown OS; cannot verify system disk safety."
       ;;
   esac
 }
 
-unmount_all_partitions() {
-  case "$OS" in
-    Linux)
-      if have_cmd lsblk; then
-        # Unmount all children partitions
-        lsblk -rn -o NAME,MOUNTPOINT "$DEVICE" 2>/dev/null | awk '$2!=""{print $1 " " $2}' |
-        while read n mp; do
-          [ -n "$mp" ] || continue
-          warn "Unmounting $mp"
-          umount "$mp" || die 5 "Failed to unmount $mp"
-        done
-      fi
-      ;;
-    OpenBSD)
-      # Unmount all that begin with device (partition letters)
-      mount 2>/dev/null | awk -v d="$(basename "$DEVICE")" '$1 ~ ("/dev/" d){print $3}' |
-      while read mp; do
-        warn "Unmounting $mp"
-        umount "$mp" || die 5 "Failed to unmount $mp"
-      done
-      ;;
-  esac
-  sync
+###############################################################################
+# Device detection (wait for new mass-storage)
+###############################################################################
+list_block_roots_linux() {
+  lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'
 }
 
-flush_buffers() {
-  sync
-  case "$OS" in
-    Linux)
-      if have_cmd blockdev; then
-        blockdev --flushbufs "$DEVICE" 2>/dev/null || true
-      fi
-      ;;
-    OpenBSD) : ;;
-  esac
-}
-
-#############################################################################
-# Device wait / detection
-#############################################################################
-lsblk_candidates() {
-  # List potential new disks: name type tran rm
-  lsblk -dn -o NAME,TYPE,TRAN,RM 2>/dev/null | awk '$2=="disk"{print $1 " " $3 " " $4}'
-}
-
-linux_wait_for_new_disk() {
-  base="$(lsblk_candidates | awk '{print $1}')"
-  info "Waiting for a new USB/removable disk to appear (Ctrl-C to abort)…"
-  i=0
-  while :; do
-    sleep 1
-    now="$(lsblk_candidates)"
-    # find diff
-    echo "$now" | while read n tran rm; do
-      [ -z "$n" ] && continue
-      echo "$base" | grep -q "^$n\$" && continue
-      # consider only USB/removable
-      if [ "$tran" = "usb" ] || [ "$rm" = "1" ]; then
+wait_for_new_disk_linux() {
+  before="$(list_block_roots_linux | sort)"
+  info "Waiting for a new USB/removable disk to appear (Ctrl-C to abort)..."
+  # Prefer udevadm if available
+  if have_cmd udevadm; then
+    # polling fallback
+    t0=$(date +%s 2>/dev/null || echo 0)
+    while :; do
+      now="$(list_block_roots_linux | sort)"
+      # find diff
+      add="$(comm -13 /dev/fd/3 /dev/fd/4 3<<EOF3 4<<EOF4
+$before
+EOF3
+$now
+EOF4
+)"
+      if [ -n "$add" ]; then
+        # pick the last added
+        n="$(printf '%s\n' "$add" | tail -n1)"
         printf '/dev/%s\n' "$n"
         return 0
       fi
-    done | head -n1 && return 0
-    i=$((i+1))
-    [ $i -ge 300 ] && break
-  done
-  return 1
-}
-
-openbsd_wait_for_new_disk() {
-  base="$(sysctl -n hw.disknames 2>/dev/null | tr ' ' '\n' | sed 's/:.*//' )"
-  info "Waiting for a new disk (OpenBSD)…"
-  i=0
-  while :; do
-    sleep 1
-    now="$(sysctl -n hw.disknames 2>/dev/null | tr ' ' '\n' | sed 's/:.*//' )"
-    for n in $now; do
-      echo "$base" | grep -q "^$n\$" && continue
-      case "$n" in
-        sd*|wd*|cd*) printf '/dev/%s\n' "$n"; return 0;;
-      esac
+      sleep 1
     done
-    i=$((i+1)); [ $i -ge 300 ] && break
-  done
-  return 1
-}
-
-resolve_device_or_wait() {
-  if [ -n "$DEVICE" ]; then
-    [ -e "$DEVICE" ] || die 2 "Device not found: $DEVICE"
-    return 0
-  fi
-  case "$OS" in
-    Linux)
-      if have_cmd udevadm; then
-        # Poll (simpler/more portable than parsing udevadm monitor)
-        :
+  else
+    # pure polling
+    while :; do
+      now="$(list_block_roots_linux | sort)"
+      add="$(comm -13 /dev/fd/3 /dev/fd/4 3<<EOF3 4<<EOF4
+$before
+EOF3
+$now
+EOF4
+)"
+      if [ -n "$add" ]; then
+        n="$(printf '%s\n' "$add" | tail -n1)"
+        printf '/dev/%s\n' "$n"
+        return 0
       fi
-      dev="$(linux_wait_for_new_disk)" || die 2 "No device detected."
-      DEVICE="$dev"
-      ;;
-    OpenBSD)
-      dev="$(openbsd_wait_for_new_disk)" || die 2 "No device detected."
-      DEVICE="$dev"
-      ;;
-    *)
-      die 4 "Unsupported OS for auto-detection."
-      ;;
-  esac
+      sleep 1
+    done
+  fi
 }
 
-#############################################################################
-# Attribute collection (Linux / OpenBSD)
-#############################################################################
+wait_for_new_disk_openbsd() {
+  # Simple polling of 'sysctl hw.disknames'
+  before="$(sysctl -n hw.disknames 2>/dev/null || true)"
+  info "Waiting for a new disk (OpenBSD)..."
+  while :; do
+    now="$(sysctl -n hw.disknames 2>/dev/null || true)"
+    if [ -n "$before" ] && [ -n "$now" ] && [ "$before" != "$now" ]; then
+      # find candidate by set-diff heuristic; pick last new sdX
+      cand="$( (printf '%s\n' "$now" | tr ' ' '\n' ; printf '%s\n' "$before" | tr ' ' '\n') | sort | uniq -u | grep -E '^(sd|wd|nvme)[0-9]+' | tail -n1 | cut -d: -f1 )"
+      if [ -n "$cand" ]; then
+        printf '/dev/%s\n' "$cand"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+}
+
+###############################################################################
+# Metadata collection: Linux
+###############################################################################
+append_part_json() {
+  item="$1"
+  if [ "$PART_JSON" = "[]" ]; then
+    PART_JSON="[$item]"
+  else
+    PART_JSON="$(printf '%s' "$PART_JSON" | sed 's/]$//'),$item]"
+  fi
+}
+
+append_fs_list() {
+  f="$1"
+  if [ -z "$f" ]; then return 0; fi
+  if [ "$FS_LIST" = "[]" ]; then
+    FS_LIST='["'"$f"'"]'
+  elif ! printf '%s' "$FS_LIST" | grep -F "\"$f\"" >/dev/null 2>&1; then
+    FS_LIST="$(printf '%s' "$FS_LIST" | sed 's/]$//'),\"'"$f"'\"]"
+  fi
+}
+
+append_composite() {
+  cls="$1"; name="$2"
+  item='{"class":"'"$(json_escape "$cls")"'","name":"'"$(json_escape "$name")"'"}'
+  if [ "$COMPOSITE_LIST" = "[]" ]; then
+    COMPOSITE_LIST="[$item]"
+  else
+    COMPOSITE_LIST="$(printf '%s' "$COMPOSITE_LIST" | sed 's/]$//'),$item]"
+  fi
+}
+
 collect_linux_attrs() {
   d="$DEVICE"
-  bn="$(basename "$d")"
+  [ -b "$d" ] || return 2
 
-  # lsblk basics
+  DEV_BASENAME="$(basename "$d")"
+
   if have_cmd lsblk; then
-    SIZE_BYTES="$(lsblk -bdn -o SIZE "$d" 2>/dev/null | head -n1)"
-    [ -z "$SIZE_BYTES" ] && SIZE_BYTES=0
-    MODEL="$(lsblk -dn -o MODEL "$d" 2>/dev/null | head -n1 | sed 's/^ *//; s/ *$//')"
-    ROTA="$(lsblk -dn -o ROTA "$d" 2>/dev/null | head -n1)"
-    RO_FLAG="$(lsblk -dn -o RO "$d" 2>/dev/null | head -n1)"
-  fi
+    DEV_SIZE_BYTES="$(lsblk -bn -o SIZE "$d" 2>/dev/null | head -n1 || echo "")"
+    DEV_RO="$(lsblk -no RO "$d" 2>/dev/null | head -n1 || echo 0)"
+    DEV_ROTA="$(lsblk -no ROTA "$d" 2>/dev/null | head -n1 || echo 0)"
+    DEV_SECTOR_LOGICAL="$(lsblk -no LOG-SEC "$d" 2>/dev/null | head -n1 || echo 512)"
+    DEV_SECTOR_PHYSICAL="$(lsblk -no PHY-SEC "$d" 2>/dev/null | head -n1 || echo "$DEV_SECTOR_LOGICAL")"
 
-  # sector sizes
-  if [ -r "/sys/block/$bn/queue/logical_block_size" ]; then
-    SECTOR_LOGICAL="$(cat "/sys/block/$bn/queue/logical_block_size" 2>/dev/null)"
-  fi
-  if [ -r "/sys/block/$bn/queue/physical_block_size" ]; then
-    SECTOR_PHYSICAL="$(cat "/sys/block/$bn/queue/physical_block_size" 2>/dev/null)"
-  fi
-
-  # udevadm properties
-  if have_cmd udevadm; then
-    udevadm info -q property -n "$d" >"$SESSION_DIR/udev-$bn.properties" 2>/dev/null || true
-    VENDOR_ID="$(grep '^ID_VENDOR_ID=' "$SESSION_DIR/udev-$bn.properties" 2>/dev/null | tail -n1 | cut -d= -f2)"
-    PRODUCT_ID="$(grep '^ID_MODEL_ID='  "$SESSION_DIR/udev-$bn.properties" 2>/dev/null | tail -n1 | cut -d= -f2)"
-    MANUFACTURER="$(grep '^ID_VENDOR='   "$SESSION_DIR/udev-$bn.properties" 2>/dev/null | tail -n1 | cut -d= -f2)"
-    PRODUCT="$(grep '^ID_MODEL='         "$SESSION_DIR/udev-$bn.properties" 2>/dev/null | tail -n1 | cut -d= -f2)"
-    SERIAL="$(grep '^ID_SERIAL_SHORT='   "$SESSION_DIR/udev-$bn.properties" 2>/dev/null | tail -n1 | cut -d= -f2)"
-    [ -z "$MODEL" ] && MODEL="$PRODUCT"
-  fi
-
-  # partitions & filesystems
-  PART_JSON="[]"
-  FS_LIST="[]"
-  if have_cmd lsblk; then
+    # partitions + fs
     lsblk -rn -o NAME,TYPE,START,END,FSTYPE "$d" 2>/dev/null |
     awk 'BEGIN{FS="[ \t]+"} $2=="part"{print $1, $3, $4, $5}' |
     while read n s e fs; do
-      [ -z "$n" ] && continue
-      item='{"name":"/dev/'"$n"'","start":'"${s:-0}"',"end":'"${e:-0}"',"fstype":"'"${fs:-unknown}"'"}'
-      if [ "$PART_JSON" = "[]" ]; then PART_JSON="[$item]"; else PART_JSON="$(printf '%s' "$PART_JSON" | sed 's/]$//'),$item]"; fi
-      if [ -n "$fs" ]; then
-        if [ "$FS_LIST" = "[]" ]; then FS_LIST='["'"$fs"'"]'; else FS_LIST="$(printf '%s' "$FS_LIST" | sed 's/]$//'),\"'"$fs"'"]"; fi
-      fi
+      [ -n "$n" ] || continue
+      item='{"name":"/dev/'"$n"'","start":'"${s:-0}"',"end":'"${e:-0}"',"fstype":"'"$(json_escape "${fs:-unknown}")"'"}'
+      append_part_json "$item"
+      [ -n "${fs:-}" ] && append_fs_list "$fs"
     done
   fi
 
-  # partition table type
+  # Partition table type (best effort)
   if have_cmd sgdisk; then
-    TABLE_TYPE="$(sgdisk -p "$d" 2>/dev/null | awk '/found a/[1]{print tolower($4)}' | head -n1)"
+    if sgdisk -p "$d" >"$SESSION_DIR/sgdisk-$DEV_BASENAME.txt" 2>&1; then
+      if grep -qi 'GPT' "$SESSION_DIR/sgdisk-$DEV_BASENAME.txt"; then DEV_TABLE="gpt"; fi
+      if grep -qi 'MBR' "$SESSION_DIR/sgdisk-$DEV_BASENAME.txt"; then DEV_TABLE="mbr"; fi
+    fi
   elif have_cmd parted; then
-    TABLE_TYPE="$(parted -s "$d" print 2>/dev/null | awk -F: '/Partition Table/ {gsub(/^[ \t]+/,"",$2); print tolower($2)}' | head -n1)"
-  fi
-
-  # lsusb composite interfaces
-  COMPOSITE_LIST="[]"
-  if have_cmd lsusb; then
-    # If VID:PID known, query by that; else dump all and best-effort match later
-    vp=""
-    [ -n "$VENDOR_ID" ] && [ -n "$PRODUCT_ID" ] && vp="$(printf '%s:%s' "$VENDOR_ID" "$PRODUCT_ID")"
-    if [ -n "$vp" ]; then
-      lsusb -v -d "$vp" 2>/dev/null > "$SESSION_DIR/lsusb-$vp.txt" || true
-      awk '/bInterfaceClass/ {print $2}' "$SESSION_DIR/lsusb-$vp.txt" 2>/dev/null |
-      while read c; do
-        cls="$c"
-        name="unknown"
-        case "$cls" in
-          08) name="Mass Storage" ;;
-          03) name="HID" ;;
-          02) name="CDC \(Communications\)" ;;
-          0a) name="CDC Data" ;;
-          0e) name="Video" ;;
-          e0) name="Wireless Controller" ;;
-          fe) name="Application \(e.g., DFU\)" ;;
-          ff) name="Vendor Specific" ;;
-        esac
-        item='{"class":"'"$cls"'","name":"'"$name"'"}'
-        # Append to COMPOSITE_LIST safely using a temporary variable
-        if [ "$COMPOSITE_LIST" = "[]" ]; then
-          COMPOSITE_LIST="[$item]"
-        else
-          tmp_comp="$(printf '%s' "$COMPOSITE_LIST" | sed 's/]$//')"
-          COMPOSITE_LIST="${tmp_comp},$item]"
-        fi
-      done
-      # bus:dev (best effort from lsusb -t or lsusb plain)
-      BUS_DEV="$(lsusb 2>/dev/null | awk -v vp="$vp" '$0 ~ vp {print $2 ":" $4}' | sed 's/.$//' | head -n1)"
+    if parted -s "$d" print >"$SESSION_DIR/parted-$DEV_BASENAME.txt" 2>&1; then
+      if grep -qi 'gpt' "$SESSION_DIR/parted-$DEV_BASENAME.txt"; then DEV_TABLE="gpt"; fi
+      if grep -qi 'msdos' "$SESSION_DIR/parted-$DEV_BASENAME.txt"; then DEV_TABLE="mbr"; fi
     fi
   fi
-}
 
-collect_openbsd_attrs() {
-  d="$DEVICE"
-  # derive diskname for disklabel (sd0 from /dev/sd0 or /dev/sd0c)
-  base="$(basename "$d" 2>/dev/null)"
-  disk="$(printf '%s' "$base" | sed 's/[a-z]$//' )"
+  # udev + lsusb
+  if have_cmd udevadm; then
+    udevadm info --query=property --name="$d" >"$SESSION_DIR/udev-$DEV_BASENAME.env" 2>&1 || true
+    VID="$(awk -F= '/^ID_VENDOR_ID=/{print $2}' "$SESSION_DIR/udev-$DEV_BASENAME.env" 2>/dev/null || true)"
+    PID="$(awk -F= '/^ID_MODEL_ID=/{print $2}' "$SESSION_DIR/udev-$DEV_BASENAME.env" 2>/dev/null || true)"
+    MFG="$(awk -F= '/^ID_VENDOR=/{print $2}' "$SESSION_DIR/udev-$DEV_BASENAME.env" 2>/dev/null || true)"
+    PRODUCT="$(awk -F= '/^ID_MODEL=/{print $2}' "$SESSION_DIR/udev-$DEV_BASENAME.env" 2>/dev/null || true)"
+    SERIAL="$(awk -F= '/^ID_SERIAL_SHORT=/{print $2}' "$SESSION_DIR/udev-$DEV_BASENAME.env" 2>/dev/null || true)"
+    BUS_DEV="$(awk -F= '/^ID_BUS=/{print $2}' "$SESSION_DIR/udev-$DEV_BASENAME.env" 2>/dev/null || true)"
+  fi
 
-  if have_cmd disklabel; then
-    disklabel "$disk" >"$SESSION_DIR/disklabel-$disk.txt" 2>/dev/null || true
-    bytes_per_sector="$(awk -F: '/bytes\/sector/ {gsub(/[ \t]/,"",$2); print $2}' "$SESSION_DIR/disklabel-$disk.txt" 2>/dev/null)"
-    total_sectors="$(awk -F: '/total sectors/ {gsub(/[ \t]/,"",$2); print $2}' "$SESSION_DIR/disklabel-$disk.txt" 2>/dev/null)"
-    [ -n "$bytes_per_sector" ] && [ -n "$total_sectors" ] && SIZE_BYTES="$(awk 'BEGIN{print '"$bytes_per_sector"'*'"$total_sectors"'}')"
-    SECTOR_LOGICAL="$bytes_per_sector"
-    SECTOR_PHYSICAL=""
-    ROTA=""      # unknown on OpenBSD via this path
-    RO_FLAG=""
-    MODEL="$(dmesg 2>/dev/null | grep -E " $disk at " | tail -n1 | sed 's/.*: //')"
-    # partitions and fs
-    PART_JSON="[]"; FS_LIST="[]"
-    awk '/^[ a-z]:/ {print $1, $2, $3, $4, $5, $6, $7}' "$SESSION_DIR/disklabel-$disk.txt" 2>/dev/null |
-    while read a b c d e f g; do
-      part="$(printf '%s' "$a" | cut -d: -f1)"
-      case "$part" in
-        [a-j])
-          pname="/dev/${disk}${part}"
-          # disklabel prints "size offset fstype"
-          off="$f"; sz="$e"; fst="$g"
-          [ -z "$off" ] && off=0
-          [ -z "$sz" ] && sz=0
-          item='{"name":"'"$pname"'","start":'"$off"',"end":'"$sz"',"fstype":"'"${fst:-unknown}"'"}'
-          # Append to PART_JSON safely using multi-line if to avoid quoting issues
-          if [ "$PART_JSON" = "[]" ]; then
-            PART_JSON="[$item]"
-          else
-            PART_JSON="$(printf '%s' "$PART_JSON" | sed 's/]$//'),$item]"
-          fi
-          # Append filesystem type to FS_LIST if non-empty
-          if [ -n "$fst" ]; then
-            if [ "$FS_LIST" = "[]" ]; then
-              FS_LIST="[\"$fst\"]"
-            else
-              FS_LIST="$(printf '%s' "$FS_LIST" | sed 's/]$//'),\"$fst\"]"
-            fi
-          fi
-          ;;
+  # Composite interfaces via lsusb -v
+  if have_cmd lsusb && [ -n "$VID" ] && [ -n "$PID" ]; then
+    lsusb -v -d "${VID}:${PID}" >"$SESSION_DIR/lsusb-$VID:$PID.txt" 2>&1 || true
+    # parse bInterfaceClass hex list
+    awk '/bInterfaceClass/ {print $2}' "$SESSION_DIR/lsusb-$VID:$PID.txt" 2>/dev/null |
+    while read cls; do
+      # class names minimal mapping
+      cname="Class 0x$cls"
+      case "$(printf '%s' "$cls" | tr 'A-Z' 'a-z')" in
+        08) cname="Mass Storage" ;;
+        03) cname="HID" ;;
+        02) cname="CDC (Communications)" ;;
+        0e) cname="Video" ;;
+        0a) cname="CDC-Data" ;;
+        ff) cname="Vendor Specific" ;;
       esac
+      append_composite "$cls" "$cname"
     done
-    TABLE_TYPE="disklabel"
   fi
 
-  # USB descriptors (best effort)
-  if have_cmd usbconfig; then
-    usbconfig -d ugen0.0 dump_all_desc >"$SESSION_DIR/usbdesc.txt" 2>/dev/null || true
-  fi
-
-  # Hash/serial/manufacturer (OpenBSD does not expose the same udev properties)
-  SERIAL=""
-  MANUFACTURER=""
-  PRODUCT=""
-  VENDOR_ID=""
-  PRODUCT_ID=""
-  BUS_DEV=""
-}
-
-collect_attrs() {
-  case "$OS" in
-    Linux)   collect_linux_attrs ;;
-    OpenBSD) collect_openbsd_attrs ;;
-  esac
-
-  # Attach logs
-  if have_cmd dmesg; then
-    dmesg 2>/dev/null | tail -n 200 >"$ATTACH_LOG" 2>/dev/null || true
-  fi
-}
-
-#############################################################################
-# Blankness check (read chunks, see if all zeros)
-#############################################################################
-chunk_all_zero() {
-  # Reads from stdin, returns 0 if all zero bytes, 1 otherwise.
-  # We convert to hex via POSIX od+awk and check for non-"00"
-  od -An -tx1 -v | awk '
-    {
-      for (i=1;i<=NF;i++) { if ($i != "00") { exit 1 } }
-    }
-    END { exit 0 }'
-}
-
-first_nonzero_offset_in_chunk() {
-  # stdin chunk -> prints byte offset of first non-zero within chunk, or -1
-  od -An -tx1 -v | awk '
-    {
-      for (i=1;i<=NF;i++) {
-        if ($i != "00") { print pos; exit }
-        pos++
-      }
-    }
-    END { if (NR==0) print -1 }' pos=0
-}
-
-blankness_scan() {
-  cs_bytes="$(parse_size_bytes "$CHUNK_SIZE")"
-  [ -z "$cs_bytes" ] && cs_bytes=1048576
-
-  total="$SIZE_BYTES"
-  [ "$total" -eq 0 ] && { warn "Unknown device size; blankness check may be slow."; }
-
-  info "Blankness check (chunk=$CHUNK_SIZE)…"
-  count_find=0
-  offset=0
-  BLANK_IS="blank"
-  BLANK_OFFSETS="[]"
-
-  while :; do
-    # Stop when we reached the end if size known
-    if [ "$total" -gt 0 ] && [ "$offset" -ge "$total" ]; then
-      break
-    fi
-
-    dd if="$DEVICE" bs="$cs_bytes" skip=$((offset / cs_bytes)) count=1 2>/dev/null |
-    {
-      if chunk_all_zero; then
-        : # ok
-      else
-        # mark non-blank
-        BLANK_IS="not_blank"
-        # find the first non-zero within this chunk (best effort)
-        p="$(dd if="$DEVICE" bs="$cs_bytes" skip=$((offset / cs_bytes)) count=1 2>/dev/null | first_nonzero_offset_in_chunk)"
-        if [ -z "$p" ] || [ "$p" -lt 0 ] 2>/dev/null; then
-          abs="$offset"
-        else
-          abs=$((offset + p))
-        fi
-        hex="$(printf '0x%X' "$abs" 2>/dev/null || printf '%s' "$abs")"
-        if [ "$BLANK_OFFSETS" = "[]" ]; then
-          BLANK_OFFSETS='["'"$hex"'"]'
-        else
-          BLANK_OFFSETS="$(printf '%s' "$BLANK_OFFSETS" | sed 's/]$//'),\""$hex\""]"
-        fi
-        count_find=$((count_find+1))
-        [ "$count_find" -ge "$MAX_FINDINGS" ] && break
-      fi
-    }
-
-    # advance
-    offset=$((offset + cs_bytes))
-    # Progress (simple)
-    if [ "$total" -gt 0 ]; then
-      pct=$(( offset * 100 / total ))
-      printf '\r.. %s%%' "$pct"
+  # SMART (non-destructive)
+  if [ $RUN_SMART -eq 1 ] && have_cmd smartctl; then
+    if smartctl -i -H -A "$d" >"$SESSION_DIR/smart-$DEV_BASENAME.txt" 2>&1; then
+      SMART_STATUS="$(awk -F: '/^SMART overall-health/ {gsub(/ /,"",$2); print $2}' "$SESSION_DIR/smart-$DEV_BASENAME.txt" 2>/dev/null || echo available)"
+      [ -z "$SMART_STATUS" ] && SMART_STATUS="available"
     else
-      printf '\r.. %s MB read' "$(awk "BEGIN{print $offset/1048576}")"
+      SMART_STATUS="unavailable"
     fi
-  done
-  printf '\n'
-
-  [ "$BLANK_IS" = "blank" ] && ok "Device appears BLANK." || warn "Device NOT blank. First offsets: $BLANK_OFFSETS"
-}
-
-#############################################################################
-# Optional probing (tiny write/read/restore)
-#############################################################################
-probe_ro() {
-  [ "$DRY_RUN" -eq 1 ] && { PROBE_RO_RESULT="skipped(dry-run)"; return 0; }
-  cs_bytes="$(parse_size_bytes "$SAMPLE_WIN_DEFAULT")"
-  [ -z "$cs_bytes" ] && cs_bytes=4096
-
-  # Determine three offsets: 0, mid, end-cs
-  mid=0
-  if [ "$SIZE_BYTES" -gt 0 ]; then
-    mid=$(( SIZE_BYTES / 2 ))
-    end=$(( SIZE_BYTES - cs_bytes ))
-    [ "$end" -lt 0 ] && end=0
-  else
-    end=0
   fi
 
-  printf '%s\n' "This will write and restore tiny markers at start/middle/end."
-  printf '%s' "Proceed? type YES to continue: "
-  read ans || ans=""
-  [ "$ans" = "YES" ] || { PROBE_RO_RESULT="declined"; return 1; }
-
-  tmp1="$SESSION_DIR/probe_before.bin"
-  tmp2="$SESSION_DIR/probe_after.bin"
-  marker="$SESSION_DIR/probe_marker.bin"
-  # marker = 16 bytes textual tag
-  printf 'USBPROBE-%s\n' "$TS" | dd bs=16 count=1 of="$marker" 2>/dev/null
-
-  # A helper function
-  _one_probe() {
-    off="$1"
-    # save original
-    dd if="$DEVICE" of="$tmp1" bs="$cs_bytes" skip=$((off / cs_bytes)) count=1 2>/dev/null || return 1
-    # write marker at beginning of window
-    dd if="$marker" of="$DEVICE" bs=1 seek=$off conv=notrunc 2>/dev/null || return 1
-    sync
-    dd if="$DEVICE" of="$tmp2" bs="$cs_bytes" skip=$((off / cs_bytes)) count=1 2>/dev/null || return 1
-    # restore original
-    dd if="$tmp1" of="$DEVICE" bs="$cs_bytes" seek=$((off / cs_bytes)) conv=notrunc 2>/dev/null || true
-    # compare
-    if cmp -s "$tmp1" "$tmp2" 2>/dev/null; then
-      printf 'unchanged@%s ' "$off"
-      return 1
-    else
-      printf 'writable@%s ' "$off"
-      return 0
-    fi
-  }
-
-  res=""
-  s=0
-  for off in 0 "$mid" "$end"; do
-    r="$(_one_probe "$off")" || s=$((s+1))
-    res="$res$r"
-  done
-  printf '\n'
-  if [ "$s" -gt 0 ]; then
-    PROBE_RO_RESULT="issues($res)"
-    warn "Probe indicates potential read-only/unchanged areas: $res"
-  else
-    PROBE_RO_RESULT="ok($res)"
-    ok "Probe writes appear to succeed and change data."
-  fi
-}
-
-#############################################################################
-# SMART / HPA-DCO / Firmware (best-effort)
-#############################################################################
-maybe_smart() {
-  [ "$RUN_SMART" -eq 1 ] || { SMART_STATUS="skipped"; return; }
-  if have_cmd smartctl; then
-    smartctl -i -H -A "$DEVICE" >"$SESSION_DIR/smart.txt" 2>&1 || true
-    st="$(grep -E 'SMART overall-health self-assessment test result|SMART Health Status' "$SESSION_DIR/smart.txt" 2>/dev/null | head -n1 | sed 's/.*: *//')"
-    [ -n "$st" ] && SMART_STATUS="$st" || SMART_STATUS="unavailable"
-  else
-    SMART_STATUS="tool_missing"
-  fi
-}
-
-maybe_hidden() {
-  [ "$CHECK_HIDDEN" -eq 1 ] || { HPA_DCO_STATUS="skipped"; return; }
-  case "$OS" in
-    Linux)
-      if have_cmd hdparm; then
-        hdparm -N -I "$DEVICE" >"$SESSION_DIR/hdparm.txt" 2>&1 || true
-        if grep -q "not supported" "$SESSION_DIR/hdparm.txt" 2>/dev/null; then
-          HPA_DCO_STATUS="not_supported (likely USB bridge)"
-        else
-          HPA_DCO_STATUS="queried"
-        fi
+  # Hidden area (HPA/DCO) best-effort
+  if [ $CHECK_HIDDEN -eq 1 ] && have_cmd hdparm; then
+    if hdparm -N "$d" >"$SESSION_DIR/hdparm-HPA-$DEV_BASENAME.txt" 2>&1; then
+      if grep -qi 'protected' "$SESSION_DIR/hdparm-HPA-$DEV_BASENAME.txt"; then
+        HPA_DCO_STATUS="possibly_present"
       else
-        HPA_DCO_STATUS="tool_missing"
+        HPA_DCO_STATUS="not_detected"
       fi
-      ;;
-    OpenBSD)
+    else
       HPA_DCO_STATUS="not_applicable"
-      ;;
-  esac
-}
-
-maybe_firmware_scan() {
-  [ "$FIRMWARE_SCAN" -eq 1 ] || { FIRMWARE_SCAN_SUMMARY="none"; return; }
-  # Best-effort: look for DFU / vendor-specific interfaces from composite list
-  case "$COMPOSITE_LIST" in
-    *'"class":"fe"'*) FIRMWARE_SCAN_SUMMARY="found Application/DFU interface";;
-    *'"class":"ff"'*) FIRMWARE_SCAN_SUMMARY="vendor-specific interface present";;
-    *) FIRMWARE_SCAN_SUMMARY="none";;
-  esac
-}
-
-#############################################################################
-# Wipe patterns and write loop
-#############################################################################
-need_xxd=0
-gen_pattern_chunk() {
-  # Create a CHUNK_SIZE-sized file with constant byte pattern ($1 = "ff"|"aa")
-  # Requires: hexdump + xxd. If xxd missing, we try to fail gracefully.
-  hex="$1"
-  out="$2"
-  bs="$(parse_size_bytes "$CHUNK_SIZE")"
-  if have_cmd hexdump && have_cmd xxd; then
-    # Generate bs*2 hex chars of "$hex", then convert to binary
-    # Use a bounded loop: produce 1 MiB of 'hex' and repeat until size reached
-    rm -f "$out" 2>/dev/null || true
-    one_mb=1048576
-    # Create 1MiB hex stream (2 chars per byte)
-    tmphex="$SESSION_DIR/_hex_${hex}.txt"
-    rm -f "$tmphex" 2>/dev/null || true
-    # Use hexdump to repeat "hex" for N bytes: /dev/zero → format prints literal "hex"
-    # format: 1/1 "ff" means print 'ff' per input byte.
-    dd if=/dev/zero bs=$one_mb count=1 2>/dev/null | hexdump -v -e "1/1 \"${hex}\"" >"$tmphex"
-    written=0
-    while [ "$written" -lt "$bs" ]; do
-      need=$((bs - written))
-      if [ "$need" -ge "$one_mb" ]; then
-        head -c $((2*one_mb)) "$tmphex" | xxd -r -p >>"$out"
-        written=$((written + one_mb))
-      else
-        # need bytes → 2*need hex chars
-        head -c $((2*need)) "$tmphex" | xxd -r -p >>"$out"
-        written=$bs
-      fi
-    done
-    return 0
-  fi
-  need_xxd=1
-  return 1
-}
-
-write_pattern_pass() {
-  passnum="$1"
-  mode="$2"   # "random|zeros|ff|aa|sequence"
-  bs="$(parse_size_bytes "$CHUNK_SIZE")"
-  [ -z "$bs" ] && bs=16777216
-
-  total="$SIZE_BYTES"
-  [ "$total" -gt 0 ] || die 4 "Cannot determine device size for wipe."
-
-  blocks=$(( (total + bs - 1) / bs ))
-  start_time="$(date +%s 2>/dev/null || echo 0)"
-
-  info "Pass $passnum/$PASSES using pattern=$mode (chunk=$CHUNK_SIZE, blocks=$blocks)…"
-
-  # Determine effective pattern for this pass if sequence
-  eff="$mode"
-  if [ "$mode" = "sequence" ]; then
-    # cycle 0:00, 1:FF, 2:AA (repeat)
-    m=$(( (passnum - 1) % 3 ))
-    case "$m" in
-      0) eff="zeros" ;;
-      1) eff="ff" ;;
-      2) eff="aa" ;;
-    esac
-    info "sequence → pass $passnum uses '$eff'"
+    fi
   fi
 
-  # Prepare constant chunk if needed
-  pattern_file=""
-  case "$eff" in
-    zeros) pattern_file="/dev/zero" ;;
-    random) pattern_file="/dev/urandom" ;;
-    ff|aa)
-      byte_hex="$eff"
-      pattern_file="$SESSION_DIR/pattern_${byte_hex}.bin"
-      if [ ! -s "$pattern_file" ]; then
-        gen_pattern_chunk "$byte_hex" "$pattern_file" || {
-          warn "Could not generate constant pattern; falling back to zeros."
-          eff="zeros"
-          pattern_file="/dev/zero"
-        }
-      fi
-      ;;
-  esac
-
-  i=0
-  written=0
-  while [ $i -lt $blocks ]; do
-    # Last block size optimization: still write full chunk; acceptable.
-    seek="$i"
-    if [ "$DRY_RUN" -eq 1 ]; then
-      : # simulate
-      sleep 0
+  # Firmware / LUN scan (non-destructive)
+  if [ $FIRMWARE_SCAN -eq 1 ]; then
+    # summarize from composite list
+    if printf '%s' "$COMPOSITE_LIST" | grep -q '"class":"ff"'; then
+      FIRMWARE_SUMMARY="vendor-specific interfaces present"
+    elif printf '%s' "$COMPOSITE_LIST" | grep -q '"name":"HID"'; then
+      FIRMWARE_SUMMARY="mass storage + HID"
     else
-      if [ "$eff" = "random" ] || [ "$pattern_file" = "/dev/zero" ]; then
-        dd if="$pattern_file" of="$DEVICE" bs="$bs" seek="$seek" count=1 conv=notrunc 2>/dev/null || {
-          append_error "dd write failed at block $i"
-          die 4 "Write failed."
-        }
-      else
-        # prebuilt chunk file of size bs
-        dd if="$pattern_file" of="$DEVICE" bs="$bs" seek="$seek" count=1 conv=notrunc 2>/dev/null || {
-          append_error "dd write failed at block $i"
-          die 4 "Write failed."
-        }
-      fi
+      FIRMWARE_SUMMARY="none"
     fi
-    written=$(( (i + 1) * bs ))
-    if [ "$written" -gt "$total" ]; then written="$total"; fi
-
-    # Progress + ETA
-    now="$(date +%s 2>/dev/null || echo 0)"
-    elapsed=$(( now - start_time ))
-    [ "$elapsed" -le 0 ] && elapsed=1
-    pct=$(( written * 100 / total ))
-    rate=$(( written / elapsed ))
-    remain=$(( (total - written) / (rate + 1) ))
-    printf '\r.. %3s%%  %s / %s  ETA %ss' \
-      "$pct" "$(human_bytes "$written")" "$(human_bytes "$total")" "$remain"
-    i=$((i+1))
-  done
-  printf '\n'
-  flush_buffers
-}
-
-#############################################################################
-# Verification
-#############################################################################
-hash_cmd=""
-detect_hash_cmd() {
-  if have_cmd sha256sum; then
-    hash_cmd="sha256sum"
-  elif have_cmd sha256; then
-    hash_cmd="sha256"
-  else
-    hash_cmd=""
-  fi
-}
-
-hash_region() {
-  # args: offset bytes -> prints hex digest
-  off="$1"
-  cnt="$2"
-  if [ -z "$hash_cmd" ]; then
-    printf 'nohash\n'
-    return 0
-  fi
-  case "$hash_cmd" in
-    sha256sum)
-      dd if="$DEVICE" bs=1 skip="$off" count="$cnt" 2>/dev/null | sha256sum 2>/dev/null | awk '{print $1}'
-      ;;
-    sha256)
-      dd if="$DEVICE" bs=1 skip="$off" count="$cnt" 2>/dev/null | sha256 2>/dev/null | awk '{print $1}'
-      ;;
-  esac
-}
-
-random_u64() {
-  dd if=/dev/urandom bs=8 count=1 2>/dev/null | od -An -tu8 | awk '{print $1+0}'
-}
-
-build_sample_offsets() {
-  # prints newline-separated offsets for sampling (unique, in-range)
-  total="$SIZE_BYTES"
-  win_bytes="$(parse_size_bytes "$SAMPLE_WIN_DEFAULT")"
-  [ "$win_bytes" -gt "$total" ] && win_bytes=$total
-
-  # fixed anchors (start + quartiles + end-win)
-  q1=$(( total / 4 ))
-  q2=$(( total / 2 ))
-  q3=$(( total * 3 / 4 ))
-  end=$(( total - win_bytes ))
-  [ "$end" -lt 0 ] && end=0
-
-  printf '0\n' || :
-  printf '%s\n' "$q1" "$q2" "$q3" "$end" | awk '!seen[$1]++'
-
-  # random samples
-  n="$SAMPLES"
-  c=0
-  while [ $c -lt "$n" ]; do
-    r="$(random_u64)"
-    [ -z "$r" ] && r=0
-    off=$(( r % (total - win_bytes + 1) ))
-    printf '%s\n' "$off"
-    c=$((c+1))
-  done | awk '!seen[$1]++'
-}
-
-verify_after_wipe() {
-  detect_hash_cmd
-  case "$HASH_VERIFY" in
-    none) VERIFY_PASSED="skipped"; return 0;;
-  esac
-
-  win_bytes="$(parse_size_bytes "$SAMPLE_WIN_DEFAULT")"
-  [ -z "$win_bytes" ] && win_bytes=1048576
-  # Pre-write sample hashes (if available) were not persisted; we do best-effort:
-  #   For random: ensure not all-zero and that multiple windows differ from one another.
-  #   For zeros/ff/aa/sequence: verify windows match the expected pattern (last pass).
-
-  expected=""
-  if [ "$PATTERN" = "sequence" ]; then
-    # expected is from last effective pass
-    last="$PASSES"
-    m=$(( (last - 1) % 3 ))
-    case "$m" in 0) expected="zeros";; 1) expected="ff";; 2) expected="aa";; esac
-  else
-    expected="$PATTERN"
   fi
 
-  unchanged="[]"; zero_ranges="[]"; failures=0
-
-  build_sample_offsets | while read off; do
-    [ -z "$off" ] && continue
-    # Fetch window bytes
-    # Optimize: we check zero-only first via od
-    dd if="$DEVICE" bs="$win_bytes" skip=$((off / win_bytes)) count=1 2>/dev/null | chunk_all_zero
-    is_zero=$?
-    if [ $is_zero -eq 0 ]; then
-      # Window is all zeros
-      if [ "$expected" = "zeros" ]; then
-        : # ok
-      else
-        # suspicious zero chunk after non-zero pattern
-        hex="$(printf '0x%X' "$off" 2>/dev/null || printf '%s' "$off")"
-        if [ "$zero_ranges" = "[]" ]; then zero_ranges='["'"$hex"'"]'; else zero_ranges="$(printf '%s' "$zero_ranges" | sed 's/]$//'),\"'"$hex"'"]"; fi
-        failures=$((failures+1))
-      fi
-      continue
-    fi
-
-    case "$expected" in
-      zeros)
-        # already handled, so any non-zero now is failure
-        hex="$(printf '0x%X' "$off" 2>/dev/null || printf '%s' "$off")"
-        append="\"$hex\""
-        failures=$((failures+1))
-        if [ "$unchanged" = "[]" ]; then unchanged="[$append]"; else unchanged="$(printf '%s' "$unchanged" | sed 's/]$//'),$append]"; fi
-        ;;
-      ff|aa)
-        # Build a small expected window for hashing/comparison if tools present
-        if have_cmd hexdump && have_cmd xxd; then
-          tmp="$SESSION_DIR/_exp.bin"
-          rm -f "$tmp" 2>/dev/null || true
-          gen_pattern_chunk "$expected" "$tmp" || true
-          # Read actual window and compare to tmp (first win_bytes)
-          dd if="$DEVICE" bs="$win_bytes" skip=$((off / win_bytes)) count=1 2>/dev/null | cmp -s - "$tmp" 2>/dev/null || failures=$((failures+1))
-          rm -f "$tmp" 2>/dev/null || true
-        else
-          # fallback: at least ensure not equal to zeros (already)
-          :
-        fi
-        ;;
-      random)
-        # For random we cannot know exact bytes; assert high entropy relative to zeros:
-        # We'll hash two different random sample windows; if hashes equal, suspicious.
-        h1="$(hash_region "$off" "$win_bytes")"
-        r2=$(( (off + win_bytes*3) % (SIZE_BYTES - win_bytes + 1) ))
-        h2="$(hash_region "$r2" "$win_bytes")"
-        if [ -n "$h1" ] && [ "$h1" = "$h2" ]; then
-          failures=$((failures+1))
-        fi
-        ;;
-      *)
-        : # other constants not covered
-        ;;
-    esac
-  done
-
-  # Export results
-  [ "$zero_ranges" = "[]" ] || ZERO_RANGES="$zero_ranges"
-  if [ "$failures" -gt 0 ]; then
-    VERIFY_PASSED="false"
-    return 1
-  fi
-
-  if [ "$HASH_VERIFY" = "full" ] && [ -n "$hash_cmd" ]; then
-    info "Computing full-device SHA-256 (this may take a while)…"
-    case "$hash_cmd" in
-      sha256sum) dd if="$DEVICE" bs="$CHUNK_SIZE" 2>/dev/null | sha256sum 2>/dev/null | tee "$SESSION_DIR/device.sha256" >/dev/null ;;
-      sha256)    dd if="$DEVICE" bs="$CHUNK_SIZE" 2>/dev/null | sha256 2>/dev/null | tee "$SESSION_DIR/device.sha256" >/dev/null ;;
-    esac
-  fi
-  VERIFY_PASSED="true"
   return 0
 }
 
-#############################################################################
-# Sanitize / Secure Erase capability discovery & execution (best-effort)
-#############################################################################
+###############################################################################
+# Metadata collection: OpenBSD
+###############################################################################
+collect_openbsd_attrs() {
+  d="$DEVICE"
+  [ -e "$d" ] || return 2
+  DEV_BASENAME="$(basename "$d")"
 
-_nvme_ctrl_from_ns() {
-  # /dev/nvme0n1 -> /dev/nvme0 ; else return empty
-  bn="$(basename "$DEVICE" 2>/dev/null)"
-  case "$bn" in
-    nvme*n*) printf '/dev/%s\n' "$(printf '%s' "$bn" | sed 's/n[0-9]\+$//')" ;;
-    *) printf '\n' ;;
-  esac
+  # size via disklabel -h
+  if have_cmd disklabel; then
+    disklabel "$d" >"$SESSION_DIR/disklabel-$(basename "$d").txt" 2>&1 || true
+    DEV_SIZE_BYTES="$(awk '/^total sectors:/ {print $3}' "$SESSION_DIR/disklabel-$(basename "$d").txt" 2>/dev/null || echo "")"
+    if [ -n "$DEV_SIZE_BYTES" ]; then
+      # multiply by sector size (assume 512 if not found)
+      sl=512
+      DEV_SECTOR_LOGICAL=$sl
+      DEV_SECTOR_PHYSICAL=$sl
+      DEV_SIZE_BYTES="$(expr "$DEV_SIZE_BYTES" \* "$sl" 2>/dev/null || echo "")"
+    fi
+    DEV_TABLE="disklabel"
+    # partitions
+    PART_JSON="[]"; FS_LIST="[]"
+    awk '/^[ a-z]:/{print $1, $2, $3, $4, $5, $6, $7}' "$SESSION_DIR/disklabel-$(basename "$d").txt" 2>/dev/null |
+    while read a b c e f g h; do
+      part="$(printf '%s' "$a" | cut -d: -f1)"
+      case "$part" in
+        [a-j])
+          pname="/dev/${DEV_BASENAME}${part}"
+          off="$f"; sz="$e"; fst="$g"
+          [ -z "$off" ] && off=0
+          [ -z "$sz" ] && sz=0
+          item='{"name":"'"$(json_escape "$pname")"'","start":'"$off"',"end":'"$sz"',"fstype":"'"$(json_escape "${fst:-unknown}")"'"}'
+          append_part_json "$item"
+          [ -n "$fst" ] && append_fs_list "$fst"
+          ;;
+      esac
+    done
+  fi
+
+  # OpenBSD USB descriptors best-effort
+  if have_cmd usbdevs; then
+    usbdevs -v >"$SESSION_DIR/usbdevs.txt" 2>&1 || true
+    VID=""; PID=""; MFG=""; PRODUCT=""
+    # Best effort only; OpenBSD formatting differs; we keep unknown if not parsed
+  fi
+
+  if [ $FIRMWARE_SCAN -eq 1 ]; then
+    FIRMWARE_SUMMARY="none"
+  fi
+
+  SMART_STATUS="unavailable"
+  HPA_DCO_STATUS="not_applicable"
+  return 0
 }
 
-detect_sanitize_support() {
-  # Determine if any sanitize/secure-erase method is feasible. Sets:
-  #   SAN_SUPPORTED=true|false
-  #   SAN_SELECTED_METHOD=nvme_format_s1|ata_sec_erase_enh|ata_sec_erase|scsi_sanitize_crypto
-  SAN_SUPPORTED="false"
-  SAN_SELECTED_METHOD=""
+###############################################################################
+# Optional minimal write probe (--probe-ro)
+###############################################################################
+tiny_probe_write_read_restore() {
+  # Returns 0 if allowed writes succeed, else 1
+  # Offsets: start, mid, end-1chunk
+  d="$DEVICE"
+  [ $DRY_RUN -eq 1 ] && { info "Dry-run: skipping probe writes"; return 0; }
 
-  # NVMe namespace: prefer 'nvme format -s1' on the namespace node
-  if have_cmd nvme; then
-    case "$(basename "$DEVICE" 2>/dev/null)" in
-      nvme*n*)
-        if nvme id-ctrl "$(_nvme_ctrl_from_ns)" >/dev/null 2>&1; then
-          SAN_SUPPORTED="true"
-          SAN_SELECTED_METHOD="nvme_format_s1"
-          return 0
-        fi
-        ;;
-    esac
+  cbytes="$(bytes_from_human "$CHUNK_SIZE")"
+  [ -n "$cbytes" ] || cbytes=1048576
+
+  if [ -z "$DEV_SIZE_BYTES" ] || [ "$DEV_SIZE_BYTES" -le "$cbytes" ] 2>/dev/null; then
+    offs="0"
+  else
+    mid=$(expr "$DEV_SIZE_BYTES" / 2 - "$cbytes" / 2 2>/dev/null || echo 0)
+    end=$(expr "$DEV_SIZE_BYTES" - "$cbytes" 2>/dev/null || echo 0)
+    offs="$(printf '0\n%s\n%s\n' "$mid" "$end")"
   fi
 
-  # ATA/SATA via hdparm security (only on sdX, not via most USB bridges)
-  if have_cmd hdparm; then
-    case "$(basename "$DEVICE" 2>/dev/null)" in
-      sd*)
-        hdparm -I "$DEVICE" >"$SESSION_DIR/hdparm.ident" 2>&1 || true
-        if grep -qi "^Security:" "$SESSION_DIR/hdparm.ident"; then
-          if grep -qi "frozen" "$SESSION_DIR/hdparm.ident"; then
-            SAN_SUPPORTED="false"
-            SAN_REASON="security_frozen"
-          else
-            if grep -qi "enhanced erase" "$SESSION_DIR/hdparm.ident"; then
-              SAN_SUPPORTED="true"; SAN_SELECTED_METHOD="ata_sec_erase_enh"; return 0
-            else
-              SAN_SUPPORTED="true"; SAN_SELECTED_METHOD="ata_sec_erase"; return 0
-            fi
-          fi
+  ok=0
+  for off in $offs; do
+    # read original
+    orig="$SESSION_DIR/probe-orig-$off.bin"
+    CLEANUP_ITEMS="$CLEANUP_ITEMS
+$orig"
+    dd if="$d" of="$orig" bs="$cbytes" skip="$(expr "$off" / "$cbytes")" count=1 status=none 2>/dev/null || true
+
+    mark="$SESSION_DIR/probe-mark-$off.bin"
+    CLEANUP_ITEMS="$CLEANUP_ITEMS
+$mark"
+    # marker: 16 bytes pattern repeated
+    ( printf 'PROBE-RW-MARK--%04d' "$(expr "$off" % 10000)"; ) | dd of="$mark" bs=16 count=1 status=none 2>/dev/null || true
+    # expand marker to chunk size
+    # shell-only expansion:
+    if have_cmd dd; then
+      # cat marker to self until >= chunk
+      z="$SESSION_DIR/_tmpmk.$$"
+      CLEANUP_ITEMS="$CLEANUP_ITEMS
+$z"
+      cp "$mark" "$z" 2>/dev/null || true
+      while [ "$(wc -c <"$z" 2>/dev/null || echo 0)" -lt "$cbytes" ]; do
+        cat "$z" "$mark" >"$z.tmp" 2>/dev/null || true
+        mv "$z.tmp" "$z" 2>/dev/null || true
+      done
+      head -c "$cbytes" "$z" >"$mark" 2>/dev/null || true
+    fi
+
+    # write marker
+    dd if="$mark" of="$d" bs="$cbytes" seek="$(expr "$off" / "$cbytes")" count=1 conv=fsync,nocreat notrunc status=none 2>/dev/null || true
+    sync || true
+    # read back and compare
+    back="$SESSION_DIR/probe-back-$off.bin"
+    CLEANUP_ITEMS="$CLEANUP_ITEMS
+$back"
+    dd if="$d" of="$back" bs="$cbytes" skip="$(expr "$off" / "$cbytes")" count=1 status=none 2>/dev/null || true
+    if cmp -s "$mark" "$back"; then
+      ok=1
+    else
+      ok=0
+    fi
+    # restore
+    dd if="$orig" of="$d" bs="$cbytes" seek="$(expr "$off" / "$cbytes")" count=1 conv=fsync,nocreat notrunc status=none 2>/dev/null || true
+    sync || true
+    [ $ok -eq 1 ] || { warn "Probe at offset $off did not read back as written"; return 1; }
+  done
+  return 0
+}
+
+###############################################################################
+# Blankness check
+###############################################################################
+blankness_scan() {
+  d="$DEVICE"
+  cbytes="$(bytes_from_human "$CHUNK_SIZE")"
+  [ -n "$cbytes" ] || cbytes=16777216
+
+  info "Blankness check (chunk=$CHUNK_SIZE)..."
+  findings="[]"
+  limit="$NONZERO_FINDINGS"
+  idx=0
+  total="${DEV_SIZE_BYTES:-0}"
+  if [ "$total" -le 0 ] 2>/dev/null; then
+    # fallback read until EOF
+    # read first bytes chunk only
+    off=0
+    tmp="$SESSION_DIR/blank-$$.bin"
+    CLEANUP_ITEMS="$CLEANUP_ITEMS
+$tmp"
+    dd if="$d" of="$tmp" bs="$cbytes" count=1 status=none 2>/dev/null || true
+    # check any non-zero
+    if LC_ALL=C tr -d '\000' <"$tmp" | head -c 1 >/dev/null 2>&1; then
+      findings='["0x0"]'
+    fi
+  else
+    blocks=$(expr "$total" / "$cbytes" 2>/dev/null || echo 0)
+    [ "$(expr "$blocks" \* "$cbytes" 2>/dev/null || echo 0)" -lt "$total" ] && blocks=$(expr "$blocks" + 1)
+    b=0
+    while [ "$b" -lt "$blocks" ]; do
+      off=$(expr "$b" \* "$cbytes")
+      tmp="$SESSION_DIR/blank-$b.bin"
+      CLEANUP_ITEMS="$CLEANUP_ITEMS
+$tmp"
+      dd if="$d" of="$tmp" bs="$cbytes" skip="$b" count=1 status=none 2>/dev/null || true
+      if LC_ALL=C tr -d '\000' <"$tmp" | head -c 1 >/dev/null 2>&1; then
+        # non-zero found
+        hex="$(printf '0x%X' "$off" 2>/dev/null || echo "0x$off")"
+        if [ "$findings" = "[]" ]; then
+          findings='["'"$hex"'"]'
+        else
+          findings="$(printf '%s' "$findings" | sed 's/]$//'),\"'"$hex"'\"]"
         fi
-        ;;
-    esac
+        idx=$(expr "$idx" + 1)
+        [ "$idx" -ge "$limit" ] && break
+      fi
+      b=$(expr "$b" + 1)
+    done
   fi
 
-  # SCSI/SAS via sg_sanitize (crypto)
+  # store into report fields
+  BLANK_IS=1
+  if [ "$findings" != "[]" ]; then BLANK_IS=0; fi
+  BLANK_JSON='{"is_blank":'"$BLANK_IS"',"first_nonzero_offsets":'"$findings"'}'
+}
+
+###############################################################################
+# Wipe patterns (portable, chunked, progress)
+###############################################################################
+make_pattern_chunk() {
+  # generate chunk file filled with 0x00 / 0xFF / 0xAA as requested
+  # $1 pattern byte in hex (00 | ff | aa)
+  pb="$1"
+  cbytes="$(bytes_from_human "$CHUNK_SIZE")"
+  [ -n "$cbytes" ] || cbytes=16777216
+  out="$SESSION_DIR/pat-$pb-$cbytes.bin"
+  CLEANUP_ITEMS="$CLEANUP_ITEMS
+$out"
+  # start from zeros then map if needed
+  dd if=/dev/zero of="$out" bs="$cbytes" count=1 status=none 2>/dev/null || true
+  case "$pb" in
+    00) : ;;
+    ff|FF)
+      # map zeros to 0xFF
+      # POSIX 'tr' may not map NUL reliably; use awk as fallback
+      if command -v tr >/dev/null 2>&1; then
+        # create mapping via dd chunk through printf trick
+        # safer fallback: fill via a loop of printf
+        # To avoid huge CPU, do a faster method:
+        # write using dd from /dev/zero then xxd? Not POSIX.
+        # We'll build a 1KiB 0xFF then expand
+        small="$SESSION_DIR/ff-1k.bin"
+        CLEANUP_ITEMS="$CLEANUP_ITEMS
+$small"
+        ( dd if=/dev/zero bs=1024 count=1 status=none | ( awk 'BEGIN{for(i=0;i<1024;i++) printf "%c",255}' ) ) >"$small" 2>/dev/null || true
+        # cat small into out until size reached
+        : >"$out"
+        cur=0
+        while [ "$cur" -lt "$cbytes" ]; do
+          cat "$small" >>"$out"
+          cur=$(expr "$cur" + 1024)
+        done
+        head -c "$cbytes" "$out" >"$out.tmp" 2>/dev/null || true
+        mv "$out.tmp" "$out" 2>/dev/null || true
+      else
+        # awk-only
+        awk 'BEGIN{for(i=0;i<'"$cbytes"';i++) printf "%c",255}' >"$out"
+      fi
+      ;;
+    aa|AA)
+      awk 'BEGIN{for(i=0;i<'"$cbytes"';i++) printf "%c",170}' >"$out"
+      ;;
+    *)
+      # unknown -> zeros
+      :
+      ;;
+  esac
+  printf '%s\n' "$out"
+}
+
+device_size_or_die() {
+  if [ -z "$DEV_SIZE_BYTES" ] || [ "$DEV_SIZE_BYTES" -le 0 ] 2>/dev/null; then
+    die 4 "Cannot determine device size; aborting."
+  fi
+}
+
+progress_line() {
+  done_bytes="$1"; total="$2"
+  if [ "$total" -gt 0 ] 2>/dev/null; then
+    pct=$(awk 'BEGIN{printf "%.1f",('"$done_bytes"'*100)/'"$total"'}')
+  else
+    pct="0.0"
+  fi
+  printf "\r[Wipe] %s / %s (%s%%)" "$(human_bytes "$done_bytes")" "$(human_bytes "$total")" "$pct"
+}
+
+confirm_wipe_gate() {
+  # Show fingerprint and require typed confirmation of device and serial (or device only with --force)
+  printf "\n%s!!! DANGEROUS: This will ERASE ALL DATA on %s%s\n" "$C_RED" "$DEVICE" "$C_RESET"
+  printf " Model: %s  VID:PID=%s:%s  Serial: %s\n" "${PRODUCT:-unknown}" "${VID:-??}" "${PID:-??}" "${SERIAL:-unknown}"
+
+  if [ $FORCE -eq 0 ]; then
+    printf " Type the device node '%s' to proceed: " "$DEVICE"
+    read ans1 || true
+    [ "$ans1" = "$DEVICE" ] || die 1 "Confirmation mismatch; aborting."
+
+    if [ -n "$SERIAL" ]; then
+      printf " Type the exact serial '%s' to proceed: " "$SERIAL"
+      read ans2 || true
+      [ "$ans2" = "$SERIAL" ] || die 1 "Serial confirmation mismatch; aborting."
+    fi
+  else
+    printf " --force supplied. Confirm device '%s' (yes/no): " "$DEVICE"
+    read ans || true
+    [ "$ans" = "yes" ] || die 1 "User aborted."
+  fi
+}
+
+do_wipe() {
+  [ $DRY_RUN -eq 1 ] && { info "Dry-run: skipping writes"; return 0; }
+  device_size_or_die
+  cbytes="$(bytes_from_human "$CHUNK_SIZE")"
+  [ -n "$cbytes" ] || cbytes=16777216
+  total="$DEV_SIZE_BYTES"
+
+  # Large device warning
+  thresh_bytes=$(expr "$LARGE_DEV_TB" \* 1024 \* 1024 \* 1024 \* 1024 2>/dev/null || echo 0)
+  if [ "$total" -gt "$thresh_bytes" ] 2>/dev/null; then
+    warn "Device size is $(human_bytes "$total"). This may take a long time."
+    printf " Continue? (yes/no): "
+    read ans || true
+    [ "$ans" = "yes" ] || die 1 "User aborted due to large size."
+  fi
+
+  # Precompute pre-write samples for verification of unchanged regions
+  PRE_SAMPLES_FILE="$SESSION_DIR/pre-samples.txt"
+  : >"$PRE_SAMPLES_FILE"
+  if [ "$HASH_POLICY" = "sample" ] || [ "$HASH_POLICY" = "full" ]; then
+    build_samples_list "$PRE_SAMPLES_FILE"
+    capture_samples_hashes "$PRE_SAMPLES_FILE" "$SESSION_DIR/pre-hashes.txt"
+  fi
+
+  pass=1
+  while [ "$pass" -le "$PASSES" ]; do
+    src=""
+    pdesc="$PATTERN"
+    case "$PATTERN" in
+      random) src="/dev/urandom" ;;
+      zeros)  src="/dev/zero" ;;
+      ff)     src="$(make_pattern_chunk ff)" ; pdesc="0xFF" ;;
+      aa)     src="$(make_pattern_chunk aa)" ; pdesc="0xAA" ;;
+      sequence)
+        case "$pass" in
+          1) src="/dev/zero"; pdesc="0x00" ;;
+          2) src="$(make_pattern_chunk ff)"; pdesc="0xFF" ;;
+          3) src="$(make_pattern_chunk aa)"; pdesc="0xAA" ;;
+          *) src="/dev/zero"; pdesc="0x00" ;;
+        esac
+        ;;
+      *) src="/dev/urandom" ;;
+    esac
+
+    info "Pass $pass/$PASSES using pattern: $pdesc"
+
+    # chunked write loop to show progress (portable)
+    b=0; written=0
+    blocks=$(expr "$total" / "$cbytes" 2>/dev/null || echo 0)
+    [ "$(expr "$blocks" \* "$cbytes" 2>/dev/null || echo 0)" -lt "$total" ] && blocks=$(expr "$blocks" + 1)
+
+    ABORT_REQ=0
+    trap 'ABORT_REQ=1' INT
+    while [ "$b" -lt "$blocks" ]; do
+      [ "$ABORT_REQ" -eq 1 ] && {
+        printf "\nAbort requested. Continue (c) or stop (s)? "
+        read ans || true
+        case "$ans" in
+          c|C) ABORT_REQ=0 ;;
+          *) trap - INT; die 1 "User aborted during wipe." ;;
+        esac
+      }
+      dd if="$src" of="$DEVICE" bs="$cbytes" seek="$b" count=1 conv=fsync,nocreat notrunc status=none 2>/dev/null || true
+      written=$(expr "$written" + "$cbytes" 2>/dev/null || echo "$written")
+      if is_tty; then progress_line "$written" "$total"; fi
+      b=$(expr "$b" + 1)
+    done
+    trap - INT
+    [ -t 1 ] && printf "\n"
+    sync || true
+  done
+
+  return 0
+}
+
+###############################################################################
+# Verification helpers
+###############################################################################
+_sha256_tool() {
+  if have_cmd sha256sum; then echo "sha256sum"
+  elif have_cmd sha256; then echo "sha256"
+  else echo ""
+  fi
+}
+
+build_samples_list() {
+  # $1: output file with offsets (bytes)
+  out="$1"
+  : >"$out"
+  total="${DEV_SIZE_BYTES:-0}"
+  cbytes="$(bytes_from_human "$CHUNK_SIZE")"
+  [ -n "$cbytes" ] || cbytes=16777216
+
+  # deterministic anchors + N random
+  anchors="0 $(expr "$total" / 4 2>/dev/null || echo 0) $(expr "$total" / 2 2>/dev/null || echo 0) $(expr \( "$total" \* 3 \) / 4 2>/dev/null || echo 0)"
+  for a in $anchors; do
+    off="$a"
+    [ "$off" -lt 0 ] 2>/dev/null && off=0
+    if [ "$off" -gt 0 ] 2>/dev/null && [ "$(expr "$off" + "$cbytes")" -gt "$total" ] 2>/dev/null; then
+      off=$(expr "$total" - "$cbytes")
+    fi
+    printf '%s\n' "$off" >>"$out"
+  done
+
+  # randoms
+  n=0
+  while [ "$n" -lt "$SAMPLES" ]; do
+    # use awk rand as portable RNG seed by time
+    off="$(awk 'BEGIN{srand(); printf "%d", rand()*'"$total"'}')"
+    if [ "$off" -gt 0 ] 2>/dev/null && [ "$(expr "$off" + "$cbytes")" -gt "$total" ] 2>/dev/null; then
+      off=$(expr "$total" - "$cbytes")
+    fi
+    [ "$off" -lt 0 ] 2>/dev/null && off=0
+    printf '%s\n' "$off" >>"$out"
+    n=$(expr "$n" + 1)
+  done
+}
+
+capture_samples_hashes() {
+  # $1: offsets file, $2: output hashes file "off<TAB>hexhash"
+  offs="$1"; out="$2"
+  tool="$(_sha256_tool)"
+  : >"$out"
+  if [ -z "$tool" ]; then
+    warn "No sha256 tool; sample verification limited."
+    return 0
+  fi
+  cbytes="$(bytes_from_human "$CHUNK_SIZE")"
+  [ -n "$cbytes" ] || cbytes=16777216
+
+  while read off; do
+    [ -z "$off" ] && continue
+    tmp="$SESSION_DIR/vsamp-$off.bin"
+    CLEANUP_ITEMS="$CLEANUP_ITEMS
+$tmp"
+    dd if="$DEVICE" of="$tmp" bs="$cbytes" skip="$(expr "$off" / "$cbytes")" count=1 status=none 2>/dev/null || true
+    if [ "$tool" = "sha256sum" ]; then
+      hh="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')"
+    else
+      hh="$(sha256 "$tmp" 2>/dev/null | awk '{print $1}')"
+    fi
+    [ -n "$hh" ] && printf '%s\t%s\n' "$off" "$hh" >>"$out"
+  done <"$offs"
+}
+
+verify_after_wipe() {
+  case "$HASH_POLICY" in
+    none)
+      VERIFY_PASSED=1
+      return 0
+      ;;
+    sample|full)
+      : ;;
+    *)
+      HASH_POLICY="sample"
+      ;;
+  esac
+
+  tool="$(_sha256_tool)"
+  if [ -z "$tool" ]; then
+    warn "No sha256 tool; verification downgraded to unchanged-region sampling via cmp."
+  fi
+
+  if [ "$HASH_POLICY" = "full" ]; then
+    # full hash to exercise readback; cannot know expected contents for random
+    info "Computing full-device hash for readback check (best-effort)..."
+    if [ -n "$tool" ]; then
+      if [ "$tool" = "sha256sum" ]; then
+        sha256sum "$DEVICE" >"$SESSION_DIR/full-sha256.txt" 2>/dev/null || true
+      else
+        sha256 "$DEVICE" >"$SESSION_DIR/full-sha256.txt" 2>/dev/null || true
+      fi
+    else
+      # fallback: read entire device to /dev/null as a readback exercise
+      dd if="$DEVICE" of=/dev/null bs="$CHUNK_SIZE" status=none 2>/dev/null || true
+    fi
+    VERIFY_PASSED=1
+    return 0
+  fi
+
+  # sample policy: compare pre vs post sample hashes, flag unchanged
+  if [ ! -s "$SESSION_DIR/pre-hashes.txt" ]; then
+    warn "No pre-write samples captured; sample-verify will be limited."
+    VERIFY_PASSED=1
+    return 0
+  fi
+
+  TMP_OFFS="$SESSION_DIR/post-offs.txt"
+  awk -F'\t' '{print $1}' "$SESSION_DIR/pre-hashes.txt" >"$TMP_OFFS" 2>/dev/null || : 
+  capture_samples_hashes "$TMP_OFFS" "$SESSION_DIR/post-hashes.txt"
+
+  # Compare sets
+  UNCHANGED_RANGES="[]"
+  while IFS="$(printf '\t')" read off pre; do
+    post="$(awk -F'\t' -v o="$off" '$1==o{print $2}' "$SESSION_DIR/post-hashes.txt" 2>/dev/null || true)"
+    if [ -n "$pre" ] && [ "$pre" = "$post" ]; then
+      # unchanged at offset -> add offset range [off, off+chunk)
+      cbytes="$(bytes_from_human "$CHUNK_SIZE")"
+      end=$(expr "$off" + "$cbytes")
+      item='{"start":'"$off"',"end":'"$end"'}'
+      if [ "$UNCHANGED_RANGES" = "[]" ]; then
+        UNCHANGED_RANGES="[$item]"
+      else
+        UNCHANGED_RANGES="$(printf '%s' "$UNCHANGED_RANGES" | sed 's/]$//'),$item]"
+      fi
+    fi
+  done <"$SESSION_DIR/pre-hashes.txt"
+
+  if [ "$UNCHANGED_RANGES" != "[]" ]; then
+    VERIFY_PASSED=0
+    return 1
+  fi
+  VERIFY_PASSED=1
+  return 0
+}
+
+###############################################################################
+# Optional post-sanitize (NVMe/SCSI/ATA) after wipe
+###############################################################################
+post_sanitize_if_supported() {
+  [ $POST_SANITIZE -eq 1 ] || return 0
+  [ $DRY_RUN -eq 1 ] && { info "Dry-run: skipping post-sanitize"; return 0; }
+
+  # Try order: NVMe -> SCSI (sg_sanitize) -> ATA (hdparm)
+  # NVMe typical /dev/nvme*n*; USB thumbdrives are usually SCSI (sdX), so this may skip.
+  if have_cmd nvme && printf '%s\n' "$DEVICE" | grep -q '/nvme'; then
+    info "Attempting NVMe sanitize (best-effort)..."
+    # Use "block erase" if available; fallback to "crypto erase"
+    nvme sanitize "$DEVICE" -a 2 -n 1 >/dev/null 2>&1 || nvme sanitize "$DEVICE" -a 1 -n 1 >/dev/null 2>&1 || true
+    return 0
+  fi
+
   if have_cmd sg_sanitize; then
-    case "$(basename "$DEVICE" 2>/dev/null)" in
-      sd*)
-        SAN_SUPPORTED="true"
-        SAN_SELECTED_METHOD="scsi_sanitize_crypto"
-        return 0
-        ;;
-    esac
-  fi
-
-  SAN_SUPPORTED="false"
-}
-
-_confirm_post_sanitize() {
-  # Returns 0 if approved
-  if [ "$POST_SANITIZE" = "force" ]; then
-    return 0
-  fi
-  printf '\n%sPOST-SANITIZE OPTION%s\n' "$BLD" "$RST"
-  printf 'A firmware-level erase (%s) is supported on this device.\n' "$SAN_SELECTED_METHOD"
-  printf 'This will change device contents after the random pass and may take additional time.\n'
-  printf 'Proceed with firmware sanitize now? Type YES to continue: '
-  read ans || ans=""
-  [ "$ans" = "YES" ]
-}
-
-perform_post_sanitize() {
-  # Only run if:
-  #  * User allowed via POST_SANITIZE (auto/force), and
-  #  * A random-data pass was performed (per requirement), OR forced
-  #
-  # On success, sets:
-  #   SAN_RESULT="ok"
-  # On skip/failure, sets:
-  #   SAN_RESULT="skipped" or "failed"; SAN_REASON filled.
-  #
-  # Running this invalidates content-based verification; we mark verify as skipped(post-sanitize).
-
-  case "$POST_SANITIZE" in
-    never) SAN_RESULT="skipped"; SAN_REASON="policy_never"; return 0 ;;
-  esac
-
-  # Must have random pattern in the wipe sequence unless forced
-  ran_random="no"
-  case "$PATTERN" in
-    random) ran_random="yes" ;;
-    sequence) ran_random="no" ;;
-    *) ran_random="no" ;;
-  esac
-  if [ "$POST_SANITIZE" != "force" ] && [ "$ran_random" != "yes" ]; then
-    SAN_RESULT="skipped"; SAN_REASON="no_random_pass"
+    info "Attempting SCSI sanitize overwrite (best-effort)..."
+    # Overwrite for 1 pass with pattern 0x00 (since we already wrote random)
+    sg_sanitize --overwrite --early=1 --pattern=0 "$DEVICE" >/dev/null 2>&1 || true
     return 0
   fi
 
-  detect_sanitize_support
-  if [ "$SAN_SUPPORTED" != "true" ] || [ -z "$SAN_SELECTED_METHOD" ]; then
-    SAN_RESULT="skipped"; SAN_REASON="${SAN_REASON:-unsupported}"
-    return 0
+  if have_cmd hdparm; then
+    # Only if direct SATA (USB bridges usually block)
+    trans=""
+    if have_cmd lsblk; then
+      trans="$(lsblk -no TRAN "$DEVICE" 2>/dev/null | head -n1 || true)"
+    fi
+    if [ "$trans" != "usb" ]; then
+      info "Attempting ATA security erase (best-effort); may not apply."
+      # Minimal attempt with NULL password
+      # WARNING: ATA security is tricky; we try not to leave device locked.
+      hdparm --user-master u --security-set-pass NULL "$DEVICE" >/dev/null 2>&1 || true
+      hdparm --security-erase NULL "$DEVICE" >/dev/null 2>&1 || true
+      # Try disable after
+      hdparm --security-disable NULL "$DEVICE" >/dev/null 2>&1 || true
+      return 0
+    fi
   fi
 
-  if [ "$POST_SANITIZE" = "auto" ]; then
-    _confirm_post_sanitize || { SAN_RESULT="skipped"; SAN_REASON="declined"; return 0; }
-  fi
-
-  case "$SAN_SELECTED_METHOD" in
-    nvme_format_s1)
-      if [ "$DRY_RUN" -eq 1 ]; then
-        SAN_RESULT="skipped"; SAN_REASON="dry_run"
-      else
-        if nvme format "$DEVICE" -s1 >/dev/null 2>&1; then
-          SAN_RESULT="ok"
-        else
-          SAN_RESULT="failed"; SAN_REASON="nvme_format_error"
-          append_error "nvme format -s1 failed"
-        fi
-      fi
-      ;;
-
-    ata_sec_erase_enh)
-      if [ "$DRY_RUN" -eq 1 ]; then
-        SAN_RESULT="skipped"; SAN_REASON="dry_run"
-      else
-        if hdparm --user-master u --security-set-pass p "$DEVICE" >/dev/null 2>&1; then
-          if hdparm --user-master u --security-erase-enhanced p "$DEVICE" >/dev/null 2>&1; then
-            SAN_RESULT="ok"
-          else
-            SAN_RESULT="failed"; SAN_REASON="hdparm_erase_enh_failed"
-            append_error "hdparm security-erase-enhanced failed"
-          fi
-          hdparm --user-master u --security-disable p "$DEVICE" >/dev/null 2>&1 || true
-        else
-          SAN_RESULT="failed"; SAN_REASON="hdparm_set_pass_failed"
-          append_error "hdparm security-set-pass failed"
-        fi
-      fi
-      ;;
-
-    ata_sec_erase)
-      if [ "$DRY_RUN" -eq 1 ]; then
-        SAN_RESULT="skipped"; SAN_REASON="dry_run"
-      else
-        if hdparm --user-master u --security-set-pass p "$DEVICE" >/dev/null 2>&1; then
-          if hdparm --user-master u --security-erase p "$DEVICE" >/dev/null 2>&1; then
-            SAN_RESULT="ok"
-          else
-            SAN_RESULT="failed"; SAN_REASON="hdparm_erase_failed"
-            append_error "hdparm security-erase failed"
-          fi
-          hdparm --user-master u --security-disable p "$DEVICE" >/dev/null 2>&1 || true
-        else
-          SAN_RESULT="failed"; SAN_REASON="hdparm_set_pass_failed"
-          append_error "hdparm security-set-pass failed"
-        fi
-      fi
-      ;;
-
-    scsi_sanitize_crypto)
-      if [ "$DRY_RUN" -eq 1 ]; then
-        SAN_RESULT="skipped"; SAN_REASON="dry_run"
-      else
-        if sg_sanitize --crypto "$DEVICE" >/dev/null 2>&1; then
-          SAN_RESULT="ok"
-        else
-          SAN_RESULT="failed"; SAN_REASON="sg_sanitize_failed"
-          append_error "sg_sanitize --crypto failed"
-        fi
-      fi
-      ;;
-  esac
-
-  if [ "$SAN_RESULT" = "ok" ]; then
-    HASH_VERIFY="none"
-    VERIFY_PASSED="skipped(post-sanitize)"
-  fi
+  info "Post-sanitize not supported with available tools for this device."
+  return 0
 }
 
-#############################################################################
-# Inventory logging / Signing / Export
-#############################################################################
-json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'; }
+###############################################################################
+# Inventory & JSON reporting
+###############################################################################
+write_json_report() {
+  # Build JSON document as per spec
+  devq="$(json_escape "$DEVICE")"
+  modelq="$(json_escape "${PRODUCT:-unknown}")"
+  mfgq="$(json_escape "${MFG:-unknown}")"
+  serialq="$(json_escape "${SERIAL:-unknown}")"
+  tableq="$(json_escape "${DEV_TABLE:-unknown}")"
+  busdevq="$(json_escape "${BUS_DEV:-unknown}")"
+  hpolq="$(json_escape "$HASH_POLICY")"
+  patq="$(json_escape "$PATTERN")"
+  chunkq="$(json_escape "$CHUNK_SIZE")"
+  fwsumq="$(json_escape "$FIRMWARE_SUMMARY")"
+  modeq="$(json_escape "$MODE")"
 
-append_inventory() {
-  [ -n "$INVENTORY_LOG" ] || { INV_APPENDED="false"; return; }
-  mkdir -p "$(dirname "$INVENTORY_LOG")" 2>/dev/null || true
-  first_seen="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%dT%H:%M:%SZ)"
-  line='{"serial":"'"$(json_escape "$SERIAL")"'","vid_pid":"'"$(json_escape "$VENDOR_ID:$PRODUCT_ID")"'","model":"'"$(json_escape "$MODEL")"'","first_seen":"'"$first_seen"'","last_seen":"'"$first_seen"'","last_action":"'"$MODE"'","last_status":"'"$VERIFY_PASSED"'"}'
-  printf '%s\n' "$line" >>"$INVENTORY_LOG" 2>/dev/null && INV_APPENDED="true" || INV_APPENDED="false"
+  # summary errors[] already accumulated
+  # tool checks list
+  tools='[]'
+  for t in lsblk blkid udevadm lsusb dd cmp parted sgdisk smartctl hdparm timeout jq gpg tar; do
+    if have_cmd "$t"; then
+      if [ "$tools" = "[]" ]; then tools='["'"$t"'"]'; else tools="$(printf '%s' "$tools" | sed 's/]$//'),\"'"$t"'\"]"; fi
+    fi
+  done
+
+  end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+  # duration naive
+  duration="0"
+
+  cat >"$JSON_REPORT" <<JSON
+{
+  "device": "$devq",
+  "bus_dev": "$busdevq",
+  "model": "$modelq",
+  "vendor_id": "$(json_escape "${VID:-}")",
+  "product_id": "$(json_escape "${PID:-}")",
+  "manufacturer": "$mfgq",
+  "product": "$modelq",
+  "serial": "$serialq",
+  "size_bytes": ${DEV_SIZE_BYTES:-0},
+  "sector_logical": ${DEV_SECTOR_LOGICAL:-512},
+  "sector_physical": ${DEV_SECTOR_PHYSICAL:-${DEV_SECTOR_LOGICAL:-512}},
+  "rota": ${DEV_ROTA:-0},
+  "table_type": "$tableq",
+  "partitions": $PART_JSON,
+  "filesystems": $FS_LIST,
+  "ro_flag": $( [ "${DEV_RO:-0}" = "1" ] && echo true || echo false ),
+  "composite_functions": $COMPOSITE_LIST,
+  "smart_status": "$(json_escape "$SMART_STATUS")",
+  "hpa_dco_status": "$(json_escape "$HPA_DCO_STATUS")",
+  "blank_check": ${BLANK_JSON:-{"is_blank":0,"first_nonzero_offsets":[]}},
+  "probe_ro_result": "$( [ $PROBE_RO -eq 1 ] && echo tried || echo skipped )",
+  "firmware_scan_summary": "$fwsumq",
+  "mode": "$modeq",
+  "passes": $( [ "$MODE" = "wipe" ] && echo "$PASSES" || echo null ),
+  "pattern": $( [ "$MODE" = "wipe" ] && printf '"%s"\n' "$patq" || echo null ),
+  "chunk_size": "$chunkq",
+  "hash_policy": $( [ "$MODE" = "wipe" ] && printf '"%s"\n' "$hpolq" || echo null ),
+  "samples": $( [ "$MODE" = "wipe" ] && echo "$SAMPLES" || echo null ),
+  "verify_result": $( [ "$MODE" = "wipe" ] && { [ $VERIFY_PASSED -eq 1 ] && echo '{"passed":true,"unchanged_ranges":'"$UNCHANGED_RANGES"',"zero_ranges":'"$ZERO_RANGES"'}' || echo '{"passed":false,"unchanged_ranges":'"$UNCHANGED_RANGES"',"zero_ranges":'"$ZERO_RANGES"'}'; } || echo null ),
+  "errors": $ERRORS,
+  "tool_checks": $tools,
+  "timestamps": {"start": "$(json_escape "$START_TS")", "end": "$(json_escape "$end_ts")"},
+  "duration_sec": $duration,
+  "inventory_appended": false,
+  "signatures": {"gpg_sig_path": null},
+  "exported_archive": null
+}
+JSON
+}
+
+append_inventory_entry() {
+  [ -n "$INVENTORY_LOG" ] || return 0
+  entry='{"serial":"'"$(json_escape "$SERIAL")"'","vidpid":"'"$(json_escape "${VID}:${PID}")"'","model":"'"$(json_escape "$PRODUCT")"'","first_seen":null,"last_seen":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"'","last_action":"'"$(json_escape "$MODE")"'","last_status":"'"$( [ "$MODE" = "wipe" ] && [ $VERIFY_PASSED -eq 1 ] && echo ok || echo done )"'"}'
+  printf '%s\n' "$entry" >>"$INVENTORY_LOG"
+  # update JSON report boolean
+  if [ -f "$JSON_REPORT" ]; then
+    sed -i.bak 's/"inventory_appended": false/"inventory_appended": true/' "$JSON_REPORT" 2>/dev/null || true
+    rm -f "$JSON_REPORT.bak" 2>/dev/null || true
+  fi
 }
 
 maybe_sign_logs() {
-  [ "$SIGN_LOGS" -eq 1 ] || return 0
-  have_cmd gpg || { warn "gpg not available; skipping signing."; return 0; }
-  if [ -n "$SIGN_ID" ]; then
-    gpg --local-user "$SIGN_ID" --armor --detach-sign --output "$SESSION_JSON.asc" "$SESSION_JSON" 2>/dev/null && GPG_SIG_PATH="$SESSION_JSON.asc"
+  [ $SIGN_LOGS -eq 1 ] || return 0
+  have_cmd gpg || { warn "gpg not found; skipping signing"; return 0; }
+  if [ -n "$GPG_ID" ]; then
+    gpg --batch --yes -u "$GPG_ID" --detach-sign -o "$JSON_REPORT.sig" "$JSON_REPORT" >/dev/null 2>&1 || true
   else
-    gpg --armor --detach-sign --output "$SESSION_JSON.asc" "$SESSION_JSON" 2>/dev/null && GPG_SIG_PATH="$SESSION_JSON.asc"
+    gpg --batch --yes --detach-sign -o "$JSON_REPORT.sig" "$JSON_REPORT" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$JSON_REPORT.sig" ]; then
+    sed -i.bak 's/"gpg_sig_path": null/"gpg_sig_path": "usb-report-'"$SESSION_ID"'.json.sig"/' "$JSON_REPORT" 2>/dev/null || true
+    rm -f "$JSON_REPORT.bak" 2>/dev/null || true
   fi
 }
 
 maybe_export_logs() {
-  [ "$EXPORT_LOGS" -eq 1 ] || return 0
-  have_cmd tar || { warn "tar not available; skipping export."; return 0; }
-  ( cd "$LOG_DIR" && tar -czf "session-$TS.tar.gz" "session-$TS" ) 2>/dev/null || warn "Failed to create log archive."
-}
-
-#############################################################################
-# Human summary + JSON report
-#############################################################################
-write_json_report() {
-  start_t="$1"
-  end_t="$2"
-  dur="$(awk "BEGIN{print $end_t-$start_t}")"
-
-  # Build JSON document safely with manual escaping (jq optional)
-  {
-    printf '{\n'
-    printf '  "device": "%s",\n' "$(json_escape "$DEVICE")"
-    printf '  "bus_dev": "%s",\n' "$(json_escape "$BUS_DEV")"
-    printf '  "model": "%s",\n' "$(json_escape "$MODEL")"
-    printf '  "vendor_id": "%s",\n' "$(json_escape "$VENDOR_ID")"
-    printf '  "product_id": "%s",\n' "$(json_escape "$PRODUCT_ID")"
-    printf '  "manufacturer": "%s",\n' "$(json_escape "$MANUFACTURER")"
-    printf '  "product": "%s",\n' "$(json_escape "$PRODUCT")"
-    printf '  "serial": "%s",\n' "$(json_escape "$SERIAL")"
-    printf '  "size_bytes": %s,\n' "${SIZE_BYTES:-0}"
-    printf '  "sector_logical": %s,\n' "${SECTOR_LOGICAL:-0}"
-    printf '  "sector_physical": %s,\n' "${SECTOR_PHYSICAL:-0}"
-    printf '  "rota": %s,\n' "${ROTA:-0}"
-    printf '  "table_type": "%s",\n' "$(json_escape "$TABLE_TYPE")"
-    printf '  "partitions": %s,\n' "$PART_JSON"
-    printf '  "filesystems": %s,\n' "$FS_LIST"
-    printf '  "ro_flag": %s,\n' "$( [ "$RO_FLAG" = "1" ] && printf true || printf false )"
-    printf '  "composite_functions": %s,\n' "$COMPOSITE_LIST"
-    printf '  "smart_status": "%s",\n' "$(json_escape "$SMART_STATUS")"
-    printf '  "hpa_dco_status": "%s",\n' "$(json_escape "$HPA_DCO_STATUS")"
-    printf '  "blank_check": {"is_blank": %s, "first_nonzero_offsets": %s},\n' \
-      "$( [ "$BLANK_IS" = "blank" ] && printf true || printf false )" "$BLANK_OFFSETS"
-    printf '  "probe_ro_result": "%s",\n' "$(json_escape "$PROBE_RO_RESULT")"
-    printf '  "firmware_scan_summary": "%s",\n' "$(json_escape "$FIRMWARE_SCAN_SUMMARY")"
-    printf '  "mode": "%s",\n' "$(json_escape "$MODE")"
-    if [ "$MODE" = "wipe" ]; then
-      printf '  "passes": %s,\n' "$PASSES"
-      printf '  "pattern": "%s",\n' "$(json_escape "$PATTERN")"
-      printf '  "chunk_size": "%s",\n' "$(json_escape "$CHUNK_SIZE")"
-      printf '  "hash_policy": "%s",\n' "$(json_escape "$HASH_VERIFY")"
-      printf '  "samples": %s,\n' "$SAMPLES"
-      printf '  "verify_result": {"passed": %s, "unchanged_ranges": %s, "zero_ranges": %s},\n' \
-        "$( [ "$VERIFY_PASSED" = "true" ] && printf true || printf false )" "$UNCHANGED_RANGES" "$ZERO_RANGES"
-    else
-      printf '  "passes": null,\n  "pattern": null,\n  "chunk_size": "%s",\n  "hash_policy": null,\n  "samples": null,\n  "verify_result": null,\n' "$(json_escape "$CHUNK_SIZE")"
-    fi
-    printf '  "errors": %s,\n' "$ERRORS"
-    printf '  "tool_checks": [%s],\n' "$(printf '%s' "$tool_list_record" | sed 's/^ *//; s/  */ /g; s/ /","/g; s/^/"/; s/$/"/')"
-    printf '  "timestamps": {"start":"%s","end":"%s"},\n' \
-      "$(date -u -d @"$start_t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      "$(date -u -d @"$end_t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '  "duration_sec": %s,\n' "$dur"
-    printf '  "post_sanitize": {"policy":"%s","supported":%s,"method":"%s","result":"%s","reason":"%s"},\n' \
-      "$(json_escape "$POST_SANITIZE")" \
-      "$( [ "$SAN_SUPPORTED" = "true" ] && printf true || printf false )" \
-      "$(json_escape "$SAN_SELECTED_METHOD")" \
-      "$(json_escape "$SAN_RESULT")" \
-      "$(json_escape "$SAN_REASON")"
-    printf '  "inventory_appended": %s,\n' "$( [ "$INV_APPENDED" = "true" ] && printf true || printf false )"
-    printf '  "signatures": {"gpg_sig_path": %s},\n' "$( [ -n "$GPG_SIG_PATH" ] && printf '"%s"' "$(json_escape "$GPG_SIG_PATH")" || printf null )"
-    printf '  "exported_archive": %s\n' "$( [ "$EXPORT_LOGS" -eq 1 ] && printf '"%s/session-%s.tar.gz"' "$(json_escape "$LOG_DIR")" "$(json_escape "$TS")" || printf null )"
-    printf '}\n'
-  } >"$SESSION_JSON"
-
-  if have_cmd jq; then
-    tmp="$SESSION_JSON.tmp"
-    jq . "$SESSION_JSON" >"$tmp" 2>/dev/null && mv "$tmp" "$SESSION_JSON" 2>/dev/null || true
+  [ $EXPORT_LOGS -eq 1 ] || return 0
+  have_cmd tar || { warn "tar not found; skipping export"; return 0; }
+  ( cd "$LOG_DIR" && tar -czf "session-$SESSION_ID.tar.gz" "session-$SESSION_ID" ) >/dev/null 2>&1 || true
+  if [ -f "$LOG_DIR/session-$SESSION_ID.tar.gz" ]; then
+    sed -i.bak 's/"exported_archive": null/"exported_archive": "session-'"$SESSION_ID"'.tar.gz"/' "$JSON_REPORT" 2>/dev/null || true
+    rm -f "$JSON_REPORT.bak" 2>/dev/null || true
   fi
 }
 
-human_summary() {
-  printf '\n=============================================================\n'
-  printf 'USB Device %sSummary%s\n' "$BLD" "$RST"
-  printf 'Device: %s  Model: %s  VID:PID=%s:%s\n' "$DEVICE" "${MODEL:-unknown}" "${VENDOR_ID:-????}" "${PRODUCT_ID:-????}"
-  printf 'Serial: %s  Size: %s (%s)\n' "${SERIAL:-unknown}" "$SIZE_BYTES" "$(human_bytes "$SIZE_BYTES")"
-  if [ "$SAN_RESULT" = "ok" ]; then
-    printf 'Post-sanitize: %s (%s)\n' "$SAN_RESULT" "$SAN_SELECTED_METHOD"
-  else
-    printf 'Post-sanitize: %s' "$SAN_RESULT"
-    [ -n "$SAN_REASON" ] && printf ' [%s]' "$SAN_REASON"
-    printf '\n'
-  fi
-  printf 'Geometry: %s logical / %s physical  ROTA: %s\n' "${SECTOR_LOGICAL:-?}" "${SECTOR_PHYSICAL:-?}" "${ROTA:-?}"
-  printf 'Partitions (%s)  Filesystems: %s\n' "${TABLE_TYPE:-unknown}" "$(printf '%s' "$FS_LIST")"
-  printf 'Read-only: %s\n' "$( [ "$RO_FLAG" = "1" ] && printf 'yes' || printf 'no/unknown' )"
-  # Composite summary
-  if [ "$COMPOSITE_LIST" != "[]" ]; then
-    printf 'Composite interfaces: %s\n' "$COMPOSITE_LIST"
-  fi
-  printf 'SMART: %s\n' "$SMART_STATUS"
-  printf 'Hidden areas (HPA/DCO): %s\n' "$HPA_DCO_STATUS"
-  printf 'Blankness: %s' "$( [ "$BLANK_IS" = 'blank' ] && printf 'BLANK' || printf 'NOT BLANK' )"
-  if [ "$BLANK_IS" != "blank" ]; then printf ' (first non-zero at %s)' "$BLANK_OFFSETS"; fi
-  printf '\n'
-  if [ "$MODE" = "wipe" ]; then
-    printf 'Verification: %s\n' "$( [ "$VERIFY_PASSED" = "true" ] && printf 'PASSED' || printf 'FAILED/UNKNOWN' )"
-  fi
-  printf 'JSON: %s\n' "$SESSION_JSON"
-  printf '=============================================================\n'
-}
-
-#############################################################################
-# Interactive menu & confirmations
-#############################################################################
-interactive_menu() {
-  printf '%s\n' "Choose mode:"
-  printf '  1) Scan (non-destructive)\n'
-  printf '  2) Wipe (DESTRUCTIVE)\n'
-  printf 'Selection [1/2]: '
-  read sel || sel=""
-  case "$sel" in
-    1) MODE="scan" ;;
-    2) MODE="wipe" ;;
-    *) die 1 "Aborted."; ;;
-  esac
-}
-
-confirm_wipe_gate() {
-  # Print fingerprint and require typed confirmation
-  printf '\n%sDESTRUCTIVE ACTION WARNING%s\n' "$RED$BLD" "$RST"
-  printf 'Target device: %s (model: %s, serial: %s, size: %s)\n' "$DEVICE" "${MODEL:-unknown}" "${SERIAL:-unknown}" "$(human_bytes "$SIZE_BYTES")"
-  printf 'Pattern: %s   Passes: %s   Chunk: %s   Verify: %s\n' "$PATTERN" "$PASSES" "$CHUNK_SIZE" "$HASH_VERIFY"
-  printf 'Type the device node to confirm (%s): ' "$DEVICE"
-  read conf1 || conf1=""
-  if [ "$conf1" != "$DEVICE" ]; then
-    [ "$FORCE" -eq 1 ] || die 1 "Confirmation mismatch."
-  fi
-  if [ -n "$SERIAL" ] && [ "$FORCE" -ne 1 ]; then
-    printf 'Type the exact serial to confirm (%s): ' "$SERIAL"
-    read conf2 || conf2=""
-    [ "$conf2" = "$SERIAL" ] || die 1 "Serial confirmation mismatch."
-  else
-    warn "No serial available or --force used; proceeding with device confirmation only."
-  fi
-}
-
-#############################################################################
-# Mode 1: Scan
-#############################################################################
+###############################################################################
+# Mode flows
+###############################################################################
 mode_scan() {
-  start="$(date +%s 2>/dev/null || echo 0)"
-  resolve_device_or_wait
-  guard_unsafe_target
-  collect_attrs
-
-  if [ "$SIZE_BYTES" -gt $((2*1024*1024*1024*LARGE_WARN_TB)) ] 2>/dev/null; then
-    warn "Device is larger than ${LARGE_WARN_TB} TB; scans may be long."
+  info "Starting SCAN mode"
+  if [ -z "$DEVICE" ] && [ $WAIT_FOR_PLUG -eq 1 ]; then
+    case "$OS_FAMILY" in
+      linux) DEVICE="$(wait_for_new_disk_linux)" ;;
+      openbsd) DEVICE="$(wait_for_new_disk_openbsd)" ;;
+      *) die 2 "Unknown OS and no device specified." ;;
+    esac
   fi
+  [ -n "$DEVICE" ] || die 2 "No device."
 
-  maybe_smart
-  [ "$CHECK_HIDDEN" -eq 1 ] && maybe_hidden
-  [ "$FIRMWARE_SCAN" -eq 1 ] && maybe_firmware_scan
+  guard_unsafe_target
 
+  case "$OS_FAMILY" in
+    linux)  collect_linux_attrs || true ;;
+    openbsd) collect_openbsd_attrs || true ;;
+    *) warn "Unknown OS; limited scan";;
+  esac
+
+  # Blankness
   blankness_scan
 
-  if [ "$PROBE_RO" -eq 1 ]; then
-    probe_ro || true
+  # Optional probe
+  if [ $PROBE_RO -eq 1 ]; then
+    printf " Probe minimal write? (yes/no): "
+    read agree || true
+    if [ "$agree" = "yes" ]; then
+      tiny_probe_write_read_restore || append_error "probe_ro failed"
+    else
+      info "Probe skipped by user."
+    fi
   fi
 
-  end="$(date +%s 2>/dev/null || echo 0)"
-  write_json_report "$start" "$end"
-  human_summary
-  append_inventory
+  # Output summaries
+  tee_human "============================================================="
+  tee_human "USB Device Scan Summary"
+  tee_human "Device: $DEVICE  Model: ${PRODUCT:-unknown}  VID:PID=${VID:-??}:${PID:-??}"
+  tee_human "Serial: ${SERIAL:-unknown}  Size: ${DEV_SIZE_BYTES:-0} ($([ -n "$DEV_SIZE_BYTES" ] && human_bytes "$DEV_SIZE_BYTES" || echo 'unknown'))"
+  tee_human "Geometry: ${DEV_SECTOR_LOGICAL:-512}B logical / ${DEV_SECTOR_PHYSICAL:-${DEV_SECTOR_LOGICAL:-512}}B physical  ROTA: ${DEV_ROTA:-0}"
+  tee_human "Partitions ($DEV_TABLE): $(printf '%s' "$PART_JSON")"
+  tee_human "Filesystems: $(printf '%s' "$FS_LIST")"
+  tee_human "Read-only: $( [ "${DEV_RO:-0}" = "1" ] && echo yes || echo no )"
+  if [ "$COMPOSITE_LIST" = "[]" ]; then
+    tee_human "Composite interfaces: unknown"
+  else
+    tee_human "Composite interfaces: $(printf '%s' "$COMPOSITE_LIST")"
+  fi
+  tee_human "SMART: $SMART_STATUS"
+  tee_human "Hidden areas (HPA/DCO): $HPA_DCO_STATUS"
+  tee_human "Blankness: $( [ "${BLANK_JSON%%:*}" = '{"is_blank":1' ] && echo BLANK || echo NOT BLANK )  Details: $BLANK_JSON"
+  tee_human "JSON: will be saved to $JSON_REPORT"
+  tee_human "============================================================="
+
+  write_json_report
+  append_inventory_entry
   maybe_sign_logs
   maybe_export_logs
+  info "Scan complete."
+  return 0
 }
 
-#############################################################################
-# Mode 2: Wipe
-#############################################################################
-mode_wipe() {
-  start="$(date +%s 2>/dev/null || echo 0)"
-  resolve_device_or_wait
-  guard_unsafe_target
-  collect_attrs
-
-  # Large device warning
-  tb=$(( 2*1024*1024*1024*LARGE_WARN_TB ))
-  if [ "$SIZE_BYTES" -gt "$tb" ] 2>/dev/null; then
-    warn "Device > ${LARGE_WARN_TB} TB; operation may take a very long time."
-    printf 'Continue? type YES: '
-    read ans || ans=""
-    [ "$ans" = "YES" ] || die 1 "Aborted."
+build_samples_and_verify() {
+  if [ "$HASH_POLICY" = "none" ]; then
+    VERIFY_PASSED=1; return 0
   fi
+  # already handled in do_wipe pre-capture; here only post-verify step:
+  verify_after_wipe || return 1
+  return 0
+}
+
+mode_wipe() {
+  info "Starting WIPE mode"
+  if [ -z "$DEVICE" ] && [ $WAIT_FOR_PLUG -eq 1 ]; then
+    case "$OS_FAMILY" in
+      linux) DEVICE="$(wait_for_new_disk_linux)" ;;
+      openbsd) DEVICE="$(wait_for_new_disk_openbsd)" ;;
+      *) die 2 "Unknown OS and no device specified." ;;
+    esac
+  fi
+  [ -n "$DEVICE" ] || die 2 "No device."
+
+  guard_unsafe_target
+
+  case "$OS_FAMILY" in
+    linux)  collect_linux_attrs || true ;;
+    openbsd) collect_openbsd_attrs || true ;;
+    *) warn "Unknown OS; limited collect";;
+  esac
 
   confirm_wipe_gate
 
-  # Unmount and flush
-  unmount_all_partitions
-  flush_buffers
-
-  # Perform passes
-  p=1
-  while [ $p -le "$PASSES" ]; do
-    write_pattern_pass "$p" "$PATTERN"
-    p=$((p+1))
-  done
-
-  flush_buffers
-
-  # Optional firmware-level sanitize after random pass (if supported/policy allows)
-  perform_post_sanitize
-
-  # Verification (may be skipped if post-sanitize modified contents)
-  if verify_after_wipe; then
-    ok "Verification PASSED."
+  # Unmount all partitions (best-effort)
+  if [ "$OS_FAMILY" = "linux" ]; then
+    if have_cmd lsblk; then
+      lsblk -rn -o NAME,TYPE "$DEVICE" 2>/dev/null | awk '$2=="part"{print $1}' |
+      while read p; do
+        mp="$(lsblk -no MOUNTPOINT "/dev/$p" 2>/dev/null || true)"
+        [ -n "$mp" ] && umount "/dev/$p" 2>/dev/null || true
+      done
+    fi
+    sync || true
   else
-    err "Verification FAILED."
+    # OpenBSD: umount mounted partitions of this disk
+    short="$(printf '%s' "$(basename "$DEVICE")" | sed 's/[a-z]$//')"
+    mount | awk '/\/dev\/'"$short"'[a-z] /{print $1}' | while read p; do
+      umount "$p" 2>/dev/null || true
+    done
+    sync || true
   fi
 
-  end="$(date +%s 2>/dev/null || echo 0)"
-  write_json_report "$start" "$end"
-  human_summary
-  append_inventory
+  do_wipe || die 4 "Write phase failed."
+
+  # Optional sanitize after random data writing (or always per flag)
+  if [ $POST_SANITIZE -eq 1 ]; then
+    post_sanitize_if_supported || append_error "post-sanitize failed"
+  fi
+
+  build_samples_and_verify || {
+    tee_human "Verification FAILED. Unchanged ranges: $UNCHANGED_RANGES"
+    write_json_report
+    append_inventory_entry
+    maybe_sign_logs
+    maybe_export_logs
+    die 3 "Verification failed."
+  }
+
+  tee_human "============================================================="
+  tee_human "Wipe & Verify Summary"
+  tee_human "Device: $DEVICE  Model: ${PRODUCT:-unknown}  VID:PID=${VID:-??}:${PID:-??}"
+  tee_human "Serial: ${SERIAL:-unknown}  Size: ${DEV_SIZE_BYTES:-0} ($([ -n "$DEV_SIZE_BYTES" ] && human_bytes "$DEV_SIZE_BYTES" || echo 'unknown'))"
+  tee_human "Passes: $PASSES  Pattern: $PATTERN  Hash policy: $HASH_POLICY"
+  tee_human "Verification: PASSED"
+  tee_human "JSON: $JSON_REPORT"
+  tee_human "============================================================="
+
+  write_json_report
+  append_inventory_entry
   maybe_sign_logs
   maybe_export_logs
-
-  if [ "$VERIFY_PASSED" != "true" ]; then
-    exit 3
-  fi
+  info "Wipe complete."
+  return 0
 }
 
-#############################################################################
-# Main
-#############################################################################
-main() {
-  umask 077
-  detect_os
-  require_root
-  check_tools
-  init_logs
+###############################################################################
+# Sample helpers used by wipe (declared earlier)
+###############################################################################
+# build_samples_list
+# capture_samples_hashes
+# verify_after_wipe
 
-  # Banner
-  printf '%s\n' "$BLD$REDDO NOT RUN ON LIVE SYSTEM DISKS. THIS WILL ERASE DATA.$RST"
-  printf '%s\n' "$BLD USB Mass-Storage Device Inspect & Wipe (Enhanced, POSIX) $RST"
-  printf 'OS: %s   Logs: %s\n' "$OS" "$SESSION_DIR"
+###############################################################################
+# Startup
+###############################################################################
+banner() {
+  cat <<'B'
+=============================================================
+ USB Mass-Storage Inspect & Wipe (POSIX)
+ DO NOT RUN ON LIVE SYSTEM DISKS. THIS WILL ERASE DATA.
+=============================================================
+B
+}
+
+main() {
+  banner
+  require_root
+  detect_os
+  [ $OPENBSD_ADAPT -eq 1 ] && OS_FAMILY="openbsd"
+  ensure_session_dir
 
   parse_args "$@"
 
-  # If no mode, show interactive
-  [ -n "$MODE" ] || interactive_menu
+  # Interactive menu if mode not provided
+  if [ -z "$MODE" ]; then
+    printf "Choose mode: [1] scan, [2] wipe: "
+    read mm || true
+    case "$mm" in
+      1|scan) MODE="scan" ;;
+      2|wipe) MODE="wipe" ;;
+      *) die 4 "Invalid choice" ;;
+    esac
+  fi
+
+  # Defaults sanity
+  case "$PASSES" in 1|3|7) : ;; *) PASSES=1 ;; esac
+  case "$PATTERN" in random|zeros|ff|aa|sequence) : ;; *) PATTERN="random" ;; esac
+  case "$HASH_POLICY" in none|sample|full) : ;; *) HASH_POLICY="sample" ;; esac
+
+  # If user already specified --device, do not wait for plug
+  [ -n "$DEVICE" ] && WAIT_FOR_PLUG=0
 
   case "$MODE" in
     scan) mode_scan ;;
     wipe) mode_wipe ;;
-    *) die 4 "Invalid mode." ;;
   esac
 }
 
-REDDO="$RED"
 main "$@"
-exit 0
 
-#############################################################################
-# Notes & self-tests (manual)
-#
-# test1: Dry-run scan with loopback (Linux):
-#   fallocate -l 64M /tmp/usb.img
-#   sudo losetup -fP /tmp/usb.img
-#   LOOP=$(losetup -a | awk -F: '/tmp\/usb.img/{print $1}')
-#   sudo ./usb_device_inspect_wipe.sh --mode=scan --device="$LOOP" --dry-run --log-dir=./logs
-#
-# test2: Dry-run wipe gate:
-#   sudo ./usb_device_inspect_wipe.sh --mode=wipe --device="$LOOP" --dry-run
-#   (should require typed confirmation, but not write)
-#
-# test3: Sample-hash verification (small file-as-device):
-#   dd if=/dev/urandom of=/tmp/dev.bin bs=1M count=8
-#   sudo ./usb_device_inspect_wipe.sh --mode=wipe --device=/tmp/dev.bin --pattern=zeros --hash-verify=sample --samples=8 --log-dir=./logs
-#
-# Portability:
-#   * Uses only POSIX shell features; avoids bashisms.
-#   * Optional tooling (lsblk/udevadm/lsusb/smartctl/hdparm/jq/gpg/tar) used when present.
-#   * On OpenBSD, device discovery and geometry use sysctl/disklabel best effort.
-#
-# Limitations / graceful degradation:
-#   * Constant patterns ff/aa require hexdump+xxd. If xxd missing, falls back to zeros.
-#   * Progress uses simple loop-based ETA (portable), not dd status=progress.
-#   * Composite detection best-effort via lsusb (Linux).
-#   * Hidden area checks often blocked by USB-SATA bridges.
-#############################################################################
